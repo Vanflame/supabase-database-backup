@@ -91,6 +91,44 @@ CREATE OR REPLACE FUNCTION "public"."acquire_scheduler_lease"("p_lease_key" "tex
 ALTER FUNCTION "public"."acquire_scheduler_lease"("p_lease_key" "text", "p_ttl_seconds" integer) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."apply_payment_method_txn"("p_payment_method_id" "uuid", "p_direction" "text", "p_amount" numeric, "p_source_table" "text", "p_source_id" "uuid", "p_effective_at" timestamp with time zone) RETURNS "void"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+    IF p_payment_method_id IS NULL THEN
+        RETURN;
+    END IF;
+
+    INSERT INTO public.payment_method_transactions (
+        payment_method_id,
+        direction,
+        amount,
+        source_table,
+        source_id,
+        effective_at
+    ) VALUES (
+        p_payment_method_id,
+        p_direction,
+        p_amount,
+        p_source_table,
+        p_source_id,
+        p_effective_at
+    )
+    ON CONFLICT (source_table, source_id, direction) DO NOTHING;
+
+    IF FOUND THEN
+        UPDATE public.payment_methods
+        SET wallet_balance = COALESCE(wallet_balance, 0)
+            + CASE WHEN p_direction = 'in' THEN p_amount ELSE -p_amount END
+        WHERE id = p_payment_method_id;
+    END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."apply_payment_method_txn"("p_payment_method_id" "uuid", "p_direction" "text", "p_amount" numeric, "p_source_table" "text", "p_source_id" "uuid", "p_effective_at" timestamp with time zone) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."apply_sim_failure_streak_on_failure_record"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -3217,6 +3255,104 @@ $$;
 ALTER FUNCTION "public"."transition_otp_session_status"("session_id" "uuid", "new_status" "text", "timeout_minutes" integer) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."trg_manual_payments_apply_payment_method_balance"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+    IF NEW.status = 'approved'
+        AND NEW.voucher_id IS NULL
+        AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status)
+    THEN
+        PERFORM public.apply_payment_method_txn(
+            NEW.payment_method_id,
+            'in',
+            NEW.amount,
+            'manual_payments',
+            NEW.id,
+            COALESCE(NEW.approved_at, NOW())
+        );
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."trg_manual_payments_apply_payment_method_balance"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."trg_wallet_topups_apply_payment_method_balance"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+    v_payment_method_id UUID;
+BEGIN
+    IF NEW.status = 'approved' AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status) THEN
+        -- wallet_topups.payment_method_id is TEXT.
+        -- In practice it may contain:
+        -- 1) payment_methods.id as a UUID string, or
+        -- 2) a method key like 'gcash'
+        SELECT pm.id
+        INTO v_payment_method_id
+        FROM public.payment_methods pm
+        WHERE pm.id::text = NEW.payment_method_id
+           OR lower(pm.name) = lower(NEW.payment_method_id)
+        LIMIT 1;
+
+        PERFORM public.apply_payment_method_txn(
+            v_payment_method_id,
+            'in',
+            NEW.amount,
+            'wallet_topups',
+            NEW.id,
+            COALESCE(NEW.approved_at, NOW())
+        );
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."trg_wallet_topups_apply_payment_method_balance"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."trg_wallet_withdrawals_apply_payment_method_balance"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+    v_payment_method_id UUID;
+BEGIN
+    IF NEW.type = 'withdrawal'
+        AND NEW.status = 'success'
+        AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status)
+    THEN
+        SELECT pm.id
+        INTO v_payment_method_id
+        FROM public.withdrawal_payment_methods wpm
+        JOIN public.payment_methods pm
+            ON lower(pm.name) = lower(wpm.name)
+        WHERE wpm.id = NEW.withdrawal_payment_method_id
+        LIMIT 1;
+
+        PERFORM public.apply_payment_method_txn(
+            v_payment_method_id,
+            'out',
+            NEW.amount,
+            'wallet_transactions',
+            NEW.id,
+            COALESCE(NEW.processed_at, NOW())
+        );
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."trg_wallet_withdrawals_apply_payment_method_balance"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."trigger_agent_invite_earning_on_insert"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -4359,8 +4495,9 @@ CREATE TABLE IF NOT EXISTS "public"."daily_analytics_snapshots" (
     "total_site_loss_claimed" numeric DEFAULT 0 NOT NULL,
     "net_platform_profit" numeric DEFAULT 0 NOT NULL,
     "profit_earned_for_day" numeric DEFAULT 0 NOT NULL,
-    "overall_wallet" smallint,
-    "total_combined_balance" numeric GENERATED ALWAYS AS ((("total_wallet_balance" + "total_liabilities") + "total_agent_current_balance")) STORED
+    "overall_wallet" numeric DEFAULT 0,
+    "total_combined_liabilities" numeric GENERATED ALWAYS AS ((("total_wallet_balance" + "total_liabilities") + "total_agent_current_balance")) STORED,
+    "net_balance" numeric GENERATED ALWAYS AS (("overall_wallet" - (("total_wallet_balance" + "total_liabilities") + "total_agent_current_balance"))) STORED
 );
 
 
@@ -4859,6 +4996,23 @@ COMMENT ON COLUMN "public"."otp_sessions"."paid_with_voucher" IS 'True when this
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."payment_method_transactions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "payment_method_id" "uuid" NOT NULL,
+    "direction" "text" NOT NULL,
+    "amount" numeric(10,2) NOT NULL,
+    "source_table" "text" NOT NULL,
+    "source_id" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "effective_at" timestamp with time zone,
+    CONSTRAINT "payment_method_transactions_amount_check" CHECK (("amount" >= (0)::numeric)),
+    CONSTRAINT "payment_method_transactions_direction_check" CHECK (("direction" = ANY (ARRAY['in'::"text", 'out'::"text"])))
+);
+
+
+ALTER TABLE "public"."payment_method_transactions" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."payment_methods" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "name" "text" NOT NULL,
@@ -4869,7 +5023,8 @@ CREATE TABLE IF NOT EXISTS "public"."payment_methods" (
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "icon_url" "text",
-    "account_name" "text"
+    "account_name" "text",
+    "wallet_balance" numeric(10,2) DEFAULT 0.00 NOT NULL
 );
 
 
@@ -6648,6 +6803,11 @@ ALTER TABLE ONLY "public"."otp_sessions"
 
 
 
+ALTER TABLE ONLY "public"."payment_method_transactions"
+    ADD CONSTRAINT "payment_method_transactions_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."payment_methods"
     ADD CONSTRAINT "payment_methods_pkey" PRIMARY KEY ("id");
 
@@ -7213,6 +7373,14 @@ CREATE INDEX "idx_otp_sessions_user_status" ON "public"."otp_sessions" USING "bt
 
 
 
+CREATE INDEX "idx_payment_method_transactions_payment_method_id" ON "public"."payment_method_transactions" USING "btree" ("payment_method_id", "created_at" DESC);
+
+
+
+CREATE UNIQUE INDEX "idx_payment_method_transactions_unique_source" ON "public"."payment_method_transactions" USING "btree" ("source_table", "source_id", "direction");
+
+
+
 CREATE INDEX "idx_rate_limit_config_endpoint" ON "public"."rate_limit_config" USING "btree" ("endpoint_path") WHERE ("is_active" = true);
 
 
@@ -7685,6 +7853,10 @@ CREATE OR REPLACE TRIGGER "trg_handle_expired_session_with_messages" BEFORE UPDA
 
 
 
+CREATE OR REPLACE TRIGGER "trg_manual_payments_apply_payment_method_balance" AFTER INSERT OR UPDATE OF "status" ON "public"."manual_payments" FOR EACH ROW EXECUTE FUNCTION "public"."trg_manual_payments_apply_payment_method_balance"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_match_from_gcash" AFTER INSERT ON "public"."gcash_notif" FOR EACH ROW EXECUTE FUNCTION "public"."match_from_gcash"();
 
 
@@ -7790,6 +7962,14 @@ CREATE OR REPLACE TRIGGER "trg_update_gcash_notif_after_topup" AFTER INSERT OR U
 
 
 CREATE OR REPLACE TRIGGER "trg_update_withdrawal_payment_methods_updated_at" BEFORE UPDATE ON "public"."withdrawal_payment_methods" FOR EACH ROW EXECUTE FUNCTION "public"."update_withdrawal_payment_methods_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_wallet_topups_apply_payment_method_balance" AFTER INSERT OR UPDATE OF "status" ON "public"."wallet_topups" FOR EACH ROW EXECUTE FUNCTION "public"."trg_wallet_topups_apply_payment_method_balance"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_wallet_withdrawals_apply_payment_method_balance" AFTER INSERT OR UPDATE OF "status" ON "public"."wallet_transactions" FOR EACH ROW EXECUTE FUNCTION "public"."trg_wallet_withdrawals_apply_payment_method_balance"();
 
 
 
@@ -8039,6 +8219,11 @@ ALTER TABLE ONLY "public"."otp_sessions"
 
 ALTER TABLE ONLY "public"."otp_sessions"
     ADD CONSTRAINT "otp_sessions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."payment_method_transactions"
+    ADD CONSTRAINT "payment_method_transactions_payment_method_id_fkey" FOREIGN KEY ("payment_method_id") REFERENCES "public"."payment_methods"("id") ON DELETE CASCADE;
 
 
 
@@ -8482,6 +8667,12 @@ GRANT ALL ON FUNCTION "public"."acquire_scheduler_lease"("p_lease_key" "text", "
 
 
 
+GRANT ALL ON FUNCTION "public"."apply_payment_method_txn"("p_payment_method_id" "uuid", "p_direction" "text", "p_amount" numeric, "p_source_table" "text", "p_source_id" "uuid", "p_effective_at" timestamp with time zone) TO "anon";
+GRANT ALL ON FUNCTION "public"."apply_payment_method_txn"("p_payment_method_id" "uuid", "p_direction" "text", "p_amount" numeric, "p_source_table" "text", "p_source_id" "uuid", "p_effective_at" timestamp with time zone) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."apply_payment_method_txn"("p_payment_method_id" "uuid", "p_direction" "text", "p_amount" numeric, "p_source_table" "text", "p_source_id" "uuid", "p_effective_at" timestamp with time zone) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."apply_sim_failure_streak_on_failure_record"() TO "anon";
 GRANT ALL ON FUNCTION "public"."apply_sim_failure_streak_on_failure_record"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."apply_sim_failure_streak_on_failure_record"() TO "service_role";
@@ -8896,6 +9087,24 @@ GRANT ALL ON FUNCTION "public"."transition_otp_session_status"("session_id" "uui
 
 
 
+GRANT ALL ON FUNCTION "public"."trg_manual_payments_apply_payment_method_balance"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trg_manual_payments_apply_payment_method_balance"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trg_manual_payments_apply_payment_method_balance"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."trg_wallet_topups_apply_payment_method_balance"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trg_wallet_topups_apply_payment_method_balance"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trg_wallet_topups_apply_payment_method_balance"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."trg_wallet_withdrawals_apply_payment_method_balance"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trg_wallet_withdrawals_apply_payment_method_balance"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trg_wallet_withdrawals_apply_payment_method_balance"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."trigger_agent_invite_earning_on_insert"() TO "anon";
 GRANT ALL ON FUNCTION "public"."trigger_agent_invite_earning_on_insert"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."trigger_agent_invite_earning_on_insert"() TO "service_role";
@@ -9292,6 +9501,12 @@ GRANT ALL ON TABLE "public"."otp_session_queue" TO "service_role";
 GRANT ALL ON TABLE "public"."otp_sessions" TO "anon";
 GRANT ALL ON TABLE "public"."otp_sessions" TO "authenticated";
 GRANT ALL ON TABLE "public"."otp_sessions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."payment_method_transactions" TO "anon";
+GRANT ALL ON TABLE "public"."payment_method_transactions" TO "authenticated";
+GRANT ALL ON TABLE "public"."payment_method_transactions" TO "service_role";
 
 
 
