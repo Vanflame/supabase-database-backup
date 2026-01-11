@@ -4497,7 +4497,8 @@ CREATE TABLE IF NOT EXISTS "public"."daily_analytics_snapshots" (
     "profit_earned_for_day" numeric DEFAULT 0 NOT NULL,
     "overall_wallet" numeric DEFAULT 0,
     "total_combined_liabilities" numeric GENERATED ALWAYS AS ((("total_wallet_balance" + "total_liabilities") + "total_agent_current_balance")) STORED,
-    "net_balance" numeric GENERATED ALWAYS AS (("overall_wallet" - (("total_wallet_balance" + "total_liabilities") + "total_agent_current_balance"))) STORED
+    "net_balance" numeric GENERATED ALWAYS AS (("overall_wallet" - (("total_wallet_balance" + "total_liabilities") + "total_agent_current_balance"))) STORED,
+    "note" "text"
 );
 
 
@@ -6488,6 +6489,73 @@ CREATE TABLE IF NOT EXISTS "public"."voucher_usage" (
 
 
 ALTER TABLE "public"."voucher_usage" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."vw_agent_transactions_daily" AS
+ SELECT "date"("created_at") AS "earned_date",
+    "count"(*) AS "transaction_count",
+    ("sum"("gross_amount"))::numeric(14,2) AS "gross_amount",
+    ("sum"("agent_share"))::numeric(14,2) AS "agent_share",
+    ("sum"("site_share"))::numeric(14,2) AS "site_share"
+   FROM "public"."agent_transactions"
+  WHERE (("status")::"text" <> 'cancelled'::"text")
+  GROUP BY ("date"("created_at"))
+  ORDER BY ("date"("created_at"));
+
+
+ALTER VIEW "public"."vw_agent_transactions_daily" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."vw_agent_transactions_gross_totals" AS
+ SELECT "count"(*) AS "transaction_count",
+    (COALESCE("sum"("gross_amount"), (0)::numeric))::numeric(14,2) AS "total_gross_amount",
+    (COALESCE("sum"("agent_share"), (0)::numeric))::numeric(14,2) AS "total_agent_share",
+    (COALESCE("sum"("site_share"), (0)::numeric))::numeric(14,2) AS "total_site_share",
+    (COALESCE("sum"(
+        CASE
+            WHEN (("status")::"text" = 'claimed'::"text") THEN "agent_share"
+            ELSE (0)::numeric
+        END), (0)::numeric))::numeric(14,2) AS "agent_share_claimed",
+    (COALESCE("sum"(
+        CASE
+            WHEN (("status")::"text" = ANY ((ARRAY['pending'::character varying, 'available'::character varying])::"text"[])) THEN "agent_share"
+            ELSE (0)::numeric
+        END), (0)::numeric))::numeric(14,2) AS "agent_share_unclaimed"
+   FROM "public"."agent_transactions"
+  WHERE (("status")::"text" <> 'cancelled'::"text");
+
+
+ALTER VIEW "public"."vw_agent_transactions_gross_totals" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."vw_agent_transactions_monthly" AS
+ SELECT ("date_trunc"('month'::"text", "created_at"))::"date" AS "month_start",
+    "count"(*) AS "transaction_count",
+    (COALESCE("sum"("gross_amount"), (0)::numeric))::numeric(14,2) AS "gross_amount",
+    (COALESCE("sum"("agent_share"), (0)::numeric))::numeric(14,2) AS "agent_share",
+    (COALESCE("sum"("site_share"), (0)::numeric))::numeric(14,2) AS "site_share"
+   FROM "public"."agent_transactions"
+  WHERE (("status")::"text" <> 'cancelled'::"text")
+  GROUP BY ("date_trunc"('month'::"text", "created_at"))
+  ORDER BY (("date_trunc"('month'::"text", "created_at"))::"date");
+
+
+ALTER VIEW "public"."vw_agent_transactions_monthly" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."vw_agent_transactions_weekly" AS
+ SELECT ("date_trunc"('week'::"text", "created_at"))::"date" AS "week_start",
+    "count"(*) AS "transaction_count",
+    (COALESCE("sum"("gross_amount"), (0)::numeric))::numeric(14,2) AS "gross_amount",
+    (COALESCE("sum"("agent_share"), (0)::numeric))::numeric(14,2) AS "agent_share",
+    (COALESCE("sum"("site_share"), (0)::numeric))::numeric(14,2) AS "site_share"
+   FROM "public"."agent_transactions"
+  WHERE (("status")::"text" <> 'cancelled'::"text")
+  GROUP BY ("date_trunc"('week'::"text", "created_at"))
+  ORDER BY (("date_trunc"('week'::"text", "created_at"))::"date");
+
+
+ALTER VIEW "public"."vw_agent_transactions_weekly" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."wallet_topups" (
@@ -9855,6 +9923,30 @@ GRANT ALL ON TABLE "public"."v_vouchers_with_usage" TO "service_role";
 GRANT ALL ON TABLE "public"."voucher_usage" TO "anon";
 GRANT ALL ON TABLE "public"."voucher_usage" TO "authenticated";
 GRANT ALL ON TABLE "public"."voucher_usage" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."vw_agent_transactions_daily" TO "anon";
+GRANT ALL ON TABLE "public"."vw_agent_transactions_daily" TO "authenticated";
+GRANT ALL ON TABLE "public"."vw_agent_transactions_daily" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."vw_agent_transactions_gross_totals" TO "anon";
+GRANT ALL ON TABLE "public"."vw_agent_transactions_gross_totals" TO "authenticated";
+GRANT ALL ON TABLE "public"."vw_agent_transactions_gross_totals" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."vw_agent_transactions_monthly" TO "anon";
+GRANT ALL ON TABLE "public"."vw_agent_transactions_monthly" TO "authenticated";
+GRANT ALL ON TABLE "public"."vw_agent_transactions_monthly" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."vw_agent_transactions_weekly" TO "anon";
+GRANT ALL ON TABLE "public"."vw_agent_transactions_weekly" TO "authenticated";
+GRANT ALL ON TABLE "public"."vw_agent_transactions_weekly" TO "service_role";
 
 
 
