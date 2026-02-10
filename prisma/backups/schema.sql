@@ -5025,7 +5025,8 @@ CREATE TABLE IF NOT EXISTS "public"."payment_methods" (
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "icon_url" "text",
     "account_name" "text",
-    "wallet_balance" numeric(10,2) DEFAULT 0.00 NOT NULL
+    "wallet_balance" numeric(10,2) DEFAULT 0.00 NOT NULL,
+    "note" "text"
 );
 
 
@@ -5604,6 +5605,31 @@ CREATE TABLE IF NOT EXISTS "public"."telegram_sms_message_push_events" (
 
 
 ALTER TABLE "public"."telegram_sms_message_push_events" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."urls" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "url" "text" NOT NULL,
+    "domain" "text" NOT NULL,
+    "status" "text",
+    "status_code" integer,
+    "final_url" "text",
+    "scanned_at" timestamp with time zone,
+    "scan_error" "text",
+    "title" "text",
+    "meta_description" "text",
+    "og_image_url" "text",
+    "favicon_url" "text",
+    "logo_url" "text",
+    "risk_score" integer,
+    "risk_signals" "jsonb",
+    CONSTRAINT "urls_risk_score_check" CHECK ((("risk_score" IS NULL) OR (("risk_score" >= 0) AND ("risk_score" <= 100)))),
+    CONSTRAINT "urls_status_check" CHECK ((("status" IS NULL) OR ("status" = ANY (ARRAY['active'::"text", 'redirect'::"text", 'dead'::"text"]))))
+);
+
+
+ALTER TABLE "public"."urls" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."user_chat_links" (
@@ -7030,6 +7056,11 @@ ALTER TABLE ONLY "public"."telegram_sms_message_push_events"
 
 
 
+ALTER TABLE ONLY "public"."urls"
+    ADD CONSTRAINT "urls_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."user_chat_links"
     ADD CONSTRAINT "user_chat_links_pkey" PRIMARY KEY ("id");
 
@@ -7829,6 +7860,22 @@ CREATE UNIQUE INDEX "uq_user_chat_links_provider_user_id" ON "public"."user_chat
 
 
 
+CREATE INDEX "urls_created_at_idx" ON "public"."urls" USING "btree" ("created_at" DESC);
+
+
+
+CREATE INDEX "urls_domain_idx" ON "public"."urls" USING "btree" ("domain");
+
+
+
+CREATE INDEX "urls_status_idx" ON "public"."urls" USING "btree" ("status");
+
+
+
+CREATE UNIQUE INDEX "urls_url_unique" ON "public"."urls" USING "btree" ("url");
+
+
+
 CREATE UNIQUE INDEX "user_push_subscriptions_endpoint_key" ON "public"."user_push_subscriptions" USING "btree" ("endpoint");
 
 
@@ -8505,6 +8552,14 @@ ALTER TABLE ONLY "public"."wallet_transactions"
 
 
 
+CREATE POLICY "Public insert" ON "public"."urls" FOR INSERT WITH CHECK (true);
+
+
+
+CREATE POLICY "Public read" ON "public"."urls" FOR SELECT USING (true);
+
+
+
 CREATE POLICY "Users can delete their own settings" ON "public"."user_settings" FOR DELETE USING (("auth"."uid"() = "user_id"));
 
 
@@ -8535,6 +8590,9 @@ CREATE POLICY "Users can view their own profile" ON "public"."users" FOR SELECT 
 
 CREATE POLICY "Users can view their own settings" ON "public"."user_settings" FOR SELECT USING (("auth"."uid"() = "user_id"));
 
+
+
+ALTER TABLE "public"."urls" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."user_settings" ENABLE ROW LEVEL SECURITY;
@@ -9743,6 +9801,12 @@ GRANT ALL ON TABLE "public"."telegram_session_warning_events" TO "service_role";
 GRANT ALL ON TABLE "public"."telegram_sms_message_push_events" TO "anon";
 GRANT ALL ON TABLE "public"."telegram_sms_message_push_events" TO "authenticated";
 GRANT ALL ON TABLE "public"."telegram_sms_message_push_events" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."urls" TO "anon";
+GRANT ALL ON TABLE "public"."urls" TO "authenticated";
+GRANT ALL ON TABLE "public"."urls" TO "service_role";
 
 
 
