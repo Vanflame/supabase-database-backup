@@ -1389,6 +1389,22 @@ $$;
 ALTER FUNCTION "public"."fn_update_device_status_from_last_seen"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."generate_case_slug"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+    IF NEW.slug IS NULL OR NEW.slug = '' THEN
+        -- Generate a short 6-character alphanumeric slug
+        NEW.slug := lower(substring(NEW.id::text, 1, 6));
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."generate_case_slug"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."generate_referral_code"() RETURNS "text"
     LANGUAGE "plpgsql"
     AS $$
@@ -3991,6 +4007,19 @@ $$;
 ALTER FUNCTION "public"."update_reviews_updated_at"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."update_updated_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_updated_at"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."update_updated_at_column"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -4746,6 +4775,17 @@ ALTER SEQUENCE "public"."notification_outbox_id_seq" OWNED BY "public"."notifica
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."otp_app_subscriptions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "app_name" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."otp_app_subscriptions" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."otp_pricing" (
     "id" bigint NOT NULL,
     "app_name" "text" NOT NULL,
@@ -5031,6 +5071,39 @@ CREATE TABLE IF NOT EXISTS "public"."payment_methods" (
 
 
 ALTER TABLE "public"."payment_methods" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."proof_cases" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "title" "text" NOT NULL,
+    "description" "text",
+    "slug" "text",
+    "is_active" boolean DEFAULT true,
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "expires_at" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."proof_cases" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."proof_uploads" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "case_id" "uuid" NOT NULL,
+    "file_url" "text" NOT NULL,
+    "file_name" "text",
+    "file_type" "text",
+    "file_size" bigint,
+    "uploaded_by" "text",
+    "uploaded_by_admin" "uuid",
+    "notes" "text",
+    "created_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."proof_uploads" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."rate_limit_config" (
@@ -6867,6 +6940,11 @@ ALTER TABLE ONLY "public"."notification_outbox"
 
 
 
+ALTER TABLE ONLY "public"."otp_app_subscriptions"
+    ADD CONSTRAINT "otp_app_subscriptions_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."otp_pricing"
     ADD CONSTRAINT "otp_pricing_app_name_key" UNIQUE ("app_name");
 
@@ -6904,6 +6982,21 @@ ALTER TABLE ONLY "public"."payment_method_transactions"
 
 ALTER TABLE ONLY "public"."payment_methods"
     ADD CONSTRAINT "payment_methods_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."proof_cases"
+    ADD CONSTRAINT "proof_cases_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."proof_cases"
+    ADD CONSTRAINT "proof_cases_slug_key" UNIQUE ("slug");
+
+
+
+ALTER TABLE ONLY "public"."proof_uploads"
+    ADD CONSTRAINT "proof_uploads_pkey" PRIMARY KEY ("id");
 
 
 
@@ -7372,6 +7465,10 @@ CREATE UNIQUE INDEX "idx_notification_outbox_unique_event" ON "public"."notifica
 
 
 
+CREATE INDEX "idx_otp_app_subscriptions_app_name" ON "public"."otp_app_subscriptions" USING "btree" ("app_name");
+
+
+
 CREATE INDEX "idx_otp_pricing_allowed_carriers" ON "public"."otp_pricing" USING "gin" ("allowed_carriers") WHERE ("allowed_carriers" IS NOT NULL);
 
 
@@ -7477,6 +7574,26 @@ CREATE INDEX "idx_payment_method_transactions_payment_method_id" ON "public"."pa
 
 
 CREATE UNIQUE INDEX "idx_payment_method_transactions_unique_source" ON "public"."payment_method_transactions" USING "btree" ("source_table", "source_id", "direction");
+
+
+
+CREATE INDEX "idx_proof_cases_created_by" ON "public"."proof_cases" USING "btree" ("created_by");
+
+
+
+CREATE INDEX "idx_proof_cases_is_active" ON "public"."proof_cases" USING "btree" ("is_active");
+
+
+
+CREATE INDEX "idx_proof_cases_slug" ON "public"."proof_cases" USING "btree" ("slug");
+
+
+
+CREATE INDEX "idx_proof_uploads_case_id" ON "public"."proof_uploads" USING "btree" ("case_id");
+
+
+
+CREATE INDEX "idx_proof_uploads_created_at" ON "public"."proof_uploads" USING "btree" ("created_at" DESC);
 
 
 
@@ -7852,6 +7969,10 @@ CREATE UNIQUE INDEX "uq_chat_link_codes_provider_code" ON "public"."chat_link_co
 
 
 
+CREATE UNIQUE INDEX "uq_otp_app_subscriptions_user_app" ON "public"."otp_app_subscriptions" USING "btree" ("user_id", "app_name");
+
+
+
 CREATE UNIQUE INDEX "uq_user_chat_links_provider_chat_id" ON "public"."user_chat_links" USING "btree" ("provider", "chat_id");
 
 
@@ -8100,11 +8221,19 @@ CREATE OR REPLACE TRIGGER "trigger_auto_generate_referral_code" BEFORE INSERT ON
 
 
 
+CREATE OR REPLACE TRIGGER "trigger_generate_case_slug" BEFORE INSERT ON "public"."proof_cases" FOR EACH ROW EXECUTE FUNCTION "public"."generate_case_slug"();
+
+
+
 CREATE OR REPLACE TRIGGER "trigger_otp_completed_referral" AFTER UPDATE OF "status" ON "public"."otp_sessions" FOR EACH ROW WHEN ((("new"."status" = 'completed'::"text") AND (("old"."status" IS NULL) OR ("old"."status" <> 'completed'::"text")))) EXECUTE FUNCTION "public"."trigger_process_referral_on_otp_complete"();
 
 
 
 CREATE OR REPLACE TRIGGER "trigger_prevent_claimed_status_change" BEFORE UPDATE ON "public"."referral_milestones" FOR EACH ROW EXECUTE FUNCTION "public"."prevent_claimed_status_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "trigger_proof_cases_updated_at" BEFORE UPDATE ON "public"."proof_cases" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at"();
 
 
 
@@ -8307,6 +8436,11 @@ ALTER TABLE ONLY "public"."manual_referral_assignments"
 
 
 
+ALTER TABLE ONLY "public"."otp_app_subscriptions"
+    ADD CONSTRAINT "otp_app_subscriptions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."otp_session_queue"
     ADD CONSTRAINT "otp_session_queue_payment_id_fkey" FOREIGN KEY ("payment_id") REFERENCES "public"."manual_payments"("id");
 
@@ -8339,6 +8473,21 @@ ALTER TABLE ONLY "public"."otp_sessions"
 
 ALTER TABLE ONLY "public"."payment_method_transactions"
     ADD CONSTRAINT "payment_method_transactions_payment_method_id_fkey" FOREIGN KEY ("payment_method_id") REFERENCES "public"."payment_methods"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."proof_cases"
+    ADD CONSTRAINT "proof_cases_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "public"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."proof_uploads"
+    ADD CONSTRAINT "proof_uploads_case_id_fkey" FOREIGN KEY ("case_id") REFERENCES "public"."proof_cases"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."proof_uploads"
+    ADD CONSTRAINT "proof_uploads_uploaded_by_admin_fkey" FOREIGN KEY ("uploaded_by_admin") REFERENCES "public"."users"("id") ON DELETE SET NULL;
 
 
 
@@ -8549,6 +8698,34 @@ ALTER TABLE ONLY "public"."wallet_transactions"
 
 ALTER TABLE ONLY "public"."wallet_transactions"
     ADD CONSTRAINT "wallet_transactions_withdrawal_payment_method_id_fkey" FOREIGN KEY ("withdrawal_payment_method_id") REFERENCES "public"."withdrawal_payment_methods"("id") ON DELETE SET NULL;
+
+
+
+CREATE POLICY "Admins full access on proof_cases" ON "public"."proof_cases" USING ((EXISTS ( SELECT 1
+   FROM "public"."users"
+  WHERE (("users"."id" = "auth"."uid"()) AND ("users"."role" = 'admin'::"text")))));
+
+
+
+CREATE POLICY "Admins full access on proof_uploads" ON "public"."proof_uploads" USING ((EXISTS ( SELECT 1
+   FROM "public"."users"
+  WHERE (("users"."id" = "auth"."uid"()) AND ("users"."role" = 'admin'::"text")))));
+
+
+
+CREATE POLICY "Public can insert uploads for active cases" ON "public"."proof_uploads" FOR INSERT WITH CHECK ((EXISTS ( SELECT 1
+   FROM "public"."proof_cases"
+  WHERE (("proof_cases"."id" = "proof_uploads"."case_id") AND ("proof_cases"."is_active" = true)))));
+
+
+
+CREATE POLICY "Public can view active cases by slug" ON "public"."proof_cases" FOR SELECT USING (("is_active" = true));
+
+
+
+CREATE POLICY "Public can view uploads for active cases" ON "public"."proof_uploads" FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "public"."proof_cases"
+  WHERE (("proof_cases"."id" = "proof_uploads"."case_id") AND ("proof_cases"."is_active" = true)))));
 
 
 
@@ -8952,6 +9129,12 @@ GRANT ALL ON FUNCTION "public"."fn_accumulate_sim_uptime"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."fn_update_device_status_from_last_seen"() TO "anon";
 GRANT ALL ON FUNCTION "public"."fn_update_device_status_from_last_seen"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."fn_update_device_status_from_last_seen"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."generate_case_slug"() TO "anon";
+GRANT ALL ON FUNCTION "public"."generate_case_slug"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."generate_case_slug"() TO "service_role";
 
 
 
@@ -9375,6 +9558,12 @@ GRANT ALL ON FUNCTION "public"."update_reviews_updated_at"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."update_updated_at"() TO "anon";
+GRANT ALL ON FUNCTION "public"."update_updated_at"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_updated_at"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "anon";
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "service_role";
@@ -9600,6 +9789,12 @@ GRANT ALL ON SEQUENCE "public"."notification_outbox_id_seq" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."otp_app_subscriptions" TO "anon";
+GRANT ALL ON TABLE "public"."otp_app_subscriptions" TO "authenticated";
+GRANT ALL ON TABLE "public"."otp_app_subscriptions" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."otp_pricing" TO "anon";
 GRANT ALL ON TABLE "public"."otp_pricing" TO "authenticated";
 GRANT ALL ON TABLE "public"."otp_pricing" TO "service_role";
@@ -9639,6 +9834,18 @@ GRANT ALL ON TABLE "public"."payment_method_transactions" TO "service_role";
 GRANT ALL ON TABLE "public"."payment_methods" TO "anon";
 GRANT ALL ON TABLE "public"."payment_methods" TO "authenticated";
 GRANT ALL ON TABLE "public"."payment_methods" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."proof_cases" TO "anon";
+GRANT ALL ON TABLE "public"."proof_cases" TO "authenticated";
+GRANT ALL ON TABLE "public"."proof_cases" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."proof_uploads" TO "anon";
+GRANT ALL ON TABLE "public"."proof_uploads" TO "authenticated";
+GRANT ALL ON TABLE "public"."proof_uploads" TO "service_role";
 
 
 
