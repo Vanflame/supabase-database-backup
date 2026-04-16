@@ -131,8 +131,7 @@ ALTER FUNCTION "public"."apply_payment_method_txn"("p_payment_method_id" "uuid",
 
 CREATE OR REPLACE FUNCTION "public"."apply_sim_failure_streak_on_failure_record"() RETURNS "trigger"
     LANGUAGE "plpgsql"
-    AS $$
-DECLARE
+    AS $$DECLARE
   v_app_name text;
   v_next_failed_apps text[];
   v_distinct_count integer;
@@ -169,7 +168,7 @@ BEGIN
   -- Auto-pause SIM after 3 distinct failed apps (Option 3: count all failure types)
   IF v_distinct_count >= 3 THEN
     UPDATE public.sims
-    SET status = 'PAUSED',
+    SET status = 'DISABLED',
         paused_at = now(),
         paused_reason = 'failure_streak_3_apps',
         paused_context = jsonb_build_object(
@@ -217,8 +216,7 @@ BEGIN
   END IF;
 
   RETURN NEW;
-END;
-$$;
+END;$$;
 
 
 ALTER FUNCTION "public"."apply_sim_failure_streak_on_failure_record"() OWNER TO "postgres";
@@ -270,6 +268,8 @@ CREATE OR REPLACE FUNCTION "public"."auto_link_sms_to_otp_session"("p_sim_number
     AS $$
 DECLARE
   v_session              record;
+  v_candidate            record;
+  v_message              record;
   v_message_id           bigint;
   v_sender               text;
   v_existing_count       integer;
@@ -278,76 +278,43 @@ DECLARE
   v_only_otp             boolean;
   v_sender_restrictions  text[];
   v_now                  timestamptz := now();
+  v_has_any_session      boolean := false;
+  v_found_match          boolean := false;
 BEGIN
-  -- Find the most recent active/pending session for this SIM that can still accept messages.
-  SELECT *
-  INTO v_session
-  FROM public.otp_sessions
-  WHERE sim_number = p_sim_number
-    AND status IN ('pending', 'active')
-  ORDER BY created_at DESC
-  LIMIT 1;
-
-  IF NOT FOUND THEN
-    RETURN 'no_session';
-  END IF;
-
-  -- Load per-app config
-  SELECT COALESCE(max_otp_messages, 3), COALESCE(only_otp, true), sender_restrictions
-  INTO v_max_messages, v_only_otp, v_sender_restrictions
-  FROM public.otp_pricing
-  WHERE app_name = v_session.app_name
-  LIMIT 1;
-
-  IF v_max_messages IS NULL THEN
-    v_max_messages := 3;
-  END IF;
-
-  IF v_only_otp IS NULL THEN
-    v_only_otp := true;
-  END IF;
-
-  -- Check if session can still accept messages
-  SELECT COUNT(*) INTO v_existing_count
+  -- Grab the most recent unlinked message for this SIM.
+  SELECT id, sender, message, "timestamp"
+  INTO v_message
   FROM public.sms_messages
-  WHERE consumed_by_session = v_session.id;
+  WHERE sim_number = p_sim_number
+    AND consumed_by_session IS NULL
+  ORDER BY "timestamp" DESC
+  LIMIT 1;
 
-  IF v_existing_count >= v_max_messages THEN
-    IF v_session.status != 'completed' THEN
-      UPDATE public.otp_sessions
-      SET status = 'completed',
-          status_updated_at = v_now,
-          last_activity_at = v_now
-      WHERE id = v_session.id;
-    END IF;
-    RETURN 'session_at_max_messages';
-  END IF;
-
-  -- Find the latest unlinked message after session creation.
-  -- If only_otp=true, require OTP-looking regex. Otherwise accept any message.
-  IF v_only_otp THEN
-    SELECT id, sender
-    INTO v_message_id, v_sender
-    FROM public.sms_messages
-    WHERE sim_number = p_sim_number
-      AND consumed_by_session IS NULL
-      AND "timestamp" >= v_session.created_at
-      AND message ~ '(?<!\d)(?!(?:\+?63|0)\d{8,10})(?:\d{4,8}|\d(?:[-\s]?\d){4,7})(?!\d)'
-    ORDER BY "timestamp" DESC
-    LIMIT 1;
-  ELSE
-    SELECT id, sender
-    INTO v_message_id, v_sender
-    FROM public.sms_messages
-    WHERE sim_number = p_sim_number
-      AND consumed_by_session IS NULL
-      AND "timestamp" >= v_session.created_at
-    ORDER BY "timestamp" DESC
-    LIMIT 1;
-  END IF;
-
-  -- If no new message, handle expiry transitions
   IF NOT FOUND THEN
+    -- No new message: preserve prior behavior by looking at the most recent active/pending session,
+    -- and performing expiry transitions if needed.
+    SELECT *
+    INTO v_session
+    FROM public.otp_sessions
+    WHERE sim_number = p_sim_number
+      AND status IN ('pending', 'active')
+    ORDER BY created_at DESC
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+      RETURN 'no_session';
+    END IF;
+
+    SELECT COALESCE(max_otp_messages, 3), COALESCE(only_otp, true), sender_restrictions
+    INTO v_max_messages, v_only_otp, v_sender_restrictions
+    FROM public.otp_pricing
+    WHERE app_name = v_session.app_name
+    LIMIT 1;
+
+    SELECT COUNT(*) INTO v_existing_count
+    FROM public.sms_messages
+    WHERE consumed_by_session = v_session.id;
+
     IF v_session.expires_at IS NOT NULL AND v_session.expires_at < v_now THEN
       IF v_existing_count > 0 THEN
         UPDATE public.otp_sessions
@@ -365,40 +332,113 @@ BEGIN
         RETURN 'expired_no_messages';
       END IF;
     END IF;
+
     RETURN 'no_valid_message';
   END IF;
 
-  ---------------------------------------------------------------------
-  -- Sender restriction enforcement (per app)
-  -- Example: restriction 'grab' matches sender 'GrabPH'
-  ---------------------------------------------------------------------
-  IF v_sender_restrictions IS NOT NULL AND array_length(v_sender_restrictions, 1) > 0 THEN
-    IF NOT EXISTS (
-      SELECT 1
-      FROM unnest(v_sender_restrictions) AS r(keyword)
-      WHERE lower(v_sender) LIKE '%' || lower(keyword) || '%'
-    ) THEN
-      RETURN 'sender_restriction_mismatch';
+  v_message_id := v_message.id;
+  v_sender := v_message.sender;
+
+  -- Find the newest session that is eligible for this message.
+  v_session := NULL;
+  v_found_match := false;
+
+  FOR v_candidate IN
+    SELECT *
+    FROM public.otp_sessions
+    WHERE sim_number = p_sim_number
+      AND status IN ('pending', 'active')
+    ORDER BY created_at DESC
+  LOOP
+    v_has_any_session := true;
+
+    -- Message must be after the session was created.
+    IF v_message."timestamp" < v_candidate.created_at THEN
+      CONTINUE;
     END IF;
-  ELSE
-    ---------------------------------------------------------------------
-    -- Fallback safety (existing behavior):
-    -- If sender matches ANY pricing app_name, require it matches this session's app.
-    ---------------------------------------------------------------------
-    IF EXISTS (
-      SELECT 1
-      FROM public.otp_pricing p
-      WHERE lower(v_sender) LIKE '%' || lower(p.app_name) || '%'
-    ) THEN
-      IF NOT EXISTS (
-        SELECT 1
-        FROM public.otp_pricing p
-        WHERE lower(p.app_name) = lower(v_session.app_name)
-          AND lower(v_sender) LIKE '%' || lower(p.app_name) || '%'
-      ) THEN
-        RETURN 'sender_mismatch';
+
+    -- Load per-app config
+    SELECT COALESCE(max_otp_messages, 3), COALESCE(only_otp, true), sender_restrictions
+    INTO v_max_messages, v_only_otp, v_sender_restrictions
+    FROM public.otp_pricing
+    WHERE app_name = v_candidate.app_name
+    LIMIT 1;
+
+    IF v_max_messages IS NULL THEN
+      v_max_messages := 3;
+    END IF;
+
+    IF v_only_otp IS NULL THEN
+      v_only_otp := true;
+    END IF;
+
+    -- Check if session can still accept messages
+    SELECT COUNT(*) INTO v_existing_count
+    FROM public.sms_messages
+    WHERE consumed_by_session = v_candidate.id;
+
+    IF v_existing_count >= v_max_messages THEN
+      IF v_candidate.status != 'completed' THEN
+        UPDATE public.otp_sessions
+        SET status = 'completed',
+            status_updated_at = v_now,
+            last_activity_at = v_now
+        WHERE id = v_candidate.id;
+      END IF;
+      CONTINUE;
+    END IF;
+
+    -- If only_otp=true, require OTP-looking regex. Otherwise accept any message.
+    IF v_only_otp THEN
+      IF v_message.message !~ '(?<!\d)(?!(?:\+?63|0)\d{8,10})(?:\d{4,8}|\d(?:[-\s]?\d){4,7})(?!\d)' THEN
+        CONTINUE;
       END IF;
     END IF;
+
+    ---------------------------------------------------------------------
+    -- Sender restriction enforcement (per app)
+    ---------------------------------------------------------------------
+    IF v_sender_restrictions IS NOT NULL AND array_length(v_sender_restrictions, 1) > 0 THEN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM unnest(v_sender_restrictions) AS r(keyword)
+        WHERE lower(v_sender) LIKE '%' || lower(keyword) || '%'
+      ) THEN
+        CONTINUE;
+      END IF;
+    ELSE
+      ---------------------------------------------------------------------
+      -- Fallback safety (existing behavior):
+      -- If sender matches ANY pricing app_name, require it matches this session's app.
+      ---------------------------------------------------------------------
+      IF EXISTS (
+        SELECT 1
+        FROM public.otp_pricing p
+        WHERE lower(v_sender) LIKE '%' || lower(p.app_name) || '%'
+      ) THEN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM public.otp_pricing p
+          WHERE lower(p.app_name) = lower(v_candidate.app_name)
+            AND lower(v_sender) LIKE '%' || lower(p.app_name) || '%'
+        ) THEN
+          CONTINUE;
+        END IF;
+      END IF;
+    END IF;
+
+    -- Found a match
+    v_session := v_candidate;
+    v_found_match := true;
+    EXIT;
+  END LOOP;
+
+  IF NOT v_has_any_session THEN
+    RETURN 'no_session';
+  END IF;
+
+  IF NOT v_found_match THEN
+    RETURN 'no_matching_session';
   END IF;
 
   -- Link the message to the session
@@ -682,6 +722,83 @@ $$;
 
 
 ALTER FUNCTION "public"."check_otp_message"("p_session_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."claim_next_sim"("p_mode" "text", "p_device_ids" "text"[] DEFAULT NULL::"text"[], "p_device_prefixes" "text"[] DEFAULT NULL::"text"[]) RETURNS TABLE("session_id" "uuid", "sim_number" "text", "device_id" "text")
+    LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  with candidate as (
+    select
+      s.number as cand_sim_number,
+      s.device_id as cand_device_id
+    from public.sims s
+    join public.devices d
+      on d.device_id = s.device_id
+    where s.status = 'ACTIVE'
+      and s.paused_at is null
+      and s.device_id is not null
+
+      -- device must be online
+      and d.last_seen >= (now() - interval '3 minutes')
+
+      -- do NOT pick sims already permanently used for this mode
+      and not exists (
+        select 1
+        from public.automation_sessions a
+        where a.sim_number = s.number
+          and a.mode = p_mode
+          and (
+            a.status in ('success','used')
+            or a.last_error_code in ('ALREADY_USED','NOT_FRESH','DEVICE_NOT_ALLOWED')
+          )
+      )
+
+      -- do NOT pick sims already in progress for this mode
+      and not exists (
+        select 1
+        from public.automation_sessions a2
+        where a2.sim_number = s.number
+          and a2.mode = p_mode
+          and a2.status in ('pending','processing')
+      )
+    order by s.number
+    for update skip locked
+    limit 1
+  ),
+  ins as (
+    insert into public.automation_sessions (
+      sim_number,
+      device_id,
+      mode,
+      status,
+      step,
+      started_at,
+      updated_at
+    )
+    select
+      c.cand_sim_number,
+      c.cand_device_id,
+      p_mode,
+      'processing',
+      'start',
+      now(),
+      now()
+    from candidate c
+    returning
+      id as session_id,
+      sim_number,
+      device_id
+  )
+  select
+    ins.session_id,
+    ins.sim_number,
+    ins.device_id
+  from ins;
+$$;
+
+
+ALTER FUNCTION "public"."claim_next_sim"("p_mode" "text", "p_device_ids" "text"[], "p_device_prefixes" "text"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."cleanup_expired_rate_limits"() RETURNS "void"
@@ -1064,13 +1181,13 @@ BEGIN
       '0950','0951',
       '0961','0963','0968','0969',
       '0970','0980','0981','0982','0985','0989',
-      '0998','0999','0960'
+      '0998','0999','0960','0932','0964'
     ) THEN 'SMART'
 
     -- DITO
     WHEN prefix4 IN (
       '0895','0896','0897','0898',
-      '0991','0992','0993','0994'
+      '0991','0992','0993','0994','0924'
     ) THEN 'DITO'
 
     ELSE NULL
@@ -1223,6 +1340,22 @@ $$;
 
 
 ALTER FUNCTION "public"."enqueue_wallet_topup_auto_approved"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."ensure_sim_stats_row"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+begin
+  insert into public.sim_stats (sim_id)
+  values (new.id)
+  on conflict (sim_id) do nothing;
+
+  return new;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."ensure_sim_stats_row"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."expire_old_sessions"() RETURNS integer
@@ -2198,6 +2331,134 @@ $$;
 ALTER FUNCTION "public"."pause_sim_on_excessive_excluded_apps"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_limit" integer DEFAULT 10) RETURNS TABLE("sim_number" "text", "device_id" "text", "eligible_count" bigint)
+    LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  with candidate as (
+    select
+      s.number as cand_sim_number,
+      s.device_id as cand_device_id
+    from public.sims s
+    join public.devices d
+      on d.device_id = s.device_id
+    where s.status = 'ACTIVE'
+      and s.paused_at is null
+      and s.device_id is not null
+
+      and d.last_seen >= (now() - interval '3 minutes')
+
+      and not exists (
+        select 1
+        from public.automation_sessions a
+        where a.sim_number = s.number
+          and a.mode = p_mode
+          and (
+            a.status in ('success','used')
+            or a.last_error_code in ('ALREADY_USED','NOT_FRESH','DEVICE_NOT_ALLOWED')
+          )
+      )
+
+      and not exists (
+        select 1
+        from public.automation_sessions a2
+        where a2.sim_number = s.number
+          and a2.mode = p_mode
+          and a2.status in ('pending','processing')
+      )
+
+    order by s.number
+  ),
+  limited as (
+    select *
+    from candidate
+    limit greatest(1, least(50, coalesce(p_limit, 10)))
+  ),
+  total as (
+    select count(*)::bigint as cnt
+    from candidate
+  )
+  select
+    l.cand_sim_number as sim_number,
+    l.cand_device_id as device_id,
+    t.cnt as eligible_count
+  from limited l
+  cross join total t;
+$$;
+
+
+ALTER FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_limit" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_device_ids" "text"[] DEFAULT NULL::"text"[], "p_device_prefixes" "text"[] DEFAULT NULL::"text"[], "p_limit" integer DEFAULT 10) RETURNS TABLE("sim_number" "text", "device_id" "text", "eligible_count" bigint)
+    LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$with candidate as (
+    select
+      s.number as cand_sim_number,
+      s.device_id as cand_device_id
+    from public.sims s
+    join public.devices d
+      on d.device_id = s.device_id
+    where s.status = 'ACTIVE'
+      and s.paused_at is null
+      and s.device_id is not null
+
+      -- Allowed device filter:
+      -- - If p_device_ids and/or p_device_prefixes are provided, accept either match.
+      -- - If neither is provided, default to admin_ prefix only.
+      and (
+        (p_device_ids is not null and s.device_id = any(p_device_ids))
+        or exists (
+          select 1
+          from unnest(coalesce(p_device_prefixes, array['admin_','gelag8203_']::text[])) as pref
+          where s.device_id like (pref || '%')
+        )
+      )
+
+      and d.last_seen >= (now() - interval '3 minutes')
+
+      and not exists (
+        select 1
+        from public.automation_sessions a
+        where a.sim_number = s.number
+          and a.mode = p_mode
+          and (
+            a.status in ('success','used')
+            or a.last_error_code in ('ALREADY_USED','NOT_FRESH','DEVICE_NOT_ALLOWED')
+          )
+      )
+
+      and not exists (
+        select 1
+        from public.automation_sessions a2
+        where a2.sim_number = s.number
+          and a2.mode = p_mode
+          and a2.status in ('pending','processing')
+      )
+
+    order by s.number
+  ),
+  limited as (
+    select *
+    from candidate
+    limit greatest(1, least(50, coalesce(p_limit, 10)))
+  ),
+  total as (
+    select count(*)::bigint as cnt
+    from candidate
+  )
+  select
+    l.cand_sim_number as sim_number,
+    l.cand_device_id as device_id,
+    t.cnt as eligible_count
+  from limited l
+  cross join total t;$$;
+
+
+ALTER FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_device_ids" "text"[], "p_device_prefixes" "text"[], "p_limit" integer) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."preserve_private_sims"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -2452,6 +2713,31 @@ ALTER FUNCTION "public"."process_referral_commission"("p_otp_session_id" "uuid",
 
 COMMENT ON FUNCTION "public"."process_referral_commission"("p_otp_session_id" "uuid", "p_user_id" "uuid") IS 'Processes referral commission when OTP session is completed. Creates exactly ONE earnings record per OTP session.';
 
+
+
+CREATE OR REPLACE FUNCTION "public"."rebuild_sim_stats_total_earnings"() RETURNS "void"
+    LANGUAGE "plpgsql"
+    AS $$
+begin
+  update public.sim_stats ss
+  set total_earnings = coalesce(t.total, 0),
+      updated_at = now()
+  from (
+    select s.id as sim_id,
+           coalesce(sum(at.agent_share), 0) as total
+    from public.sims s
+    left join public.agent_transactions at
+      on at.sim_number = s.number
+      or at.sim_number = case when left(s.number, 1) = '+' then substring(s.number from 2) else '+' || s.number end
+      or at.sim_number = case when left(s.number, 1) = '+' then s.number else '+' || s.number end
+    group by s.id
+  ) t
+  where ss.sim_id = t.sim_id;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."rebuild_sim_stats_total_earnings"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."recalculate_agent_balance_from_transactions"("p_user_id" "uuid") RETURNS TABLE("pending_balance" numeric, "available_balance" numeric, "lifetime_claimed" numeric)
@@ -3202,6 +3488,19 @@ $$;
 ALTER FUNCTION "public"."sync_wallet_topup_user_email"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."touch_worker_controls_updated_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."touch_worker_controls_updated_at"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."transition_otp_session_status"("session_id" "uuid", "new_status" "text", "timeout_minutes" integer DEFAULT 10) RETURNS boolean
     LANGUAGE "plpgsql"
     AS $$
@@ -3269,6 +3568,19 @@ $$;
 
 
 ALTER FUNCTION "public"."transition_otp_session_status"("session_id" "uuid", "new_status" "text", "timeout_minutes" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."trg_call_rebuild_sim_stats_total_earnings"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  PERFORM public.rebuild_sim_stats_total_earnings();
+    RETURN NEW;
+    END;
+    $$;
+
+
+ALTER FUNCTION "public"."trg_call_rebuild_sim_stats_total_earnings"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."trg_manual_payments_apply_payment_method_balance"() RETURNS "trigger"
@@ -3414,6 +3726,49 @@ $$;
 
 
 ALTER FUNCTION "public"."trigger_auto_link_sms"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."trigger_auto_link_sms_automation"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  v_session_id uuid;
+begin
+  -- Only link if not already linked
+  if new.consumed_by_automation_session is not null then
+    return new;
+  end if;
+
+  -- Find the most recently updated active session that is currently waiting for OTP
+  select a.id
+    into v_session_id
+  from public.automation_sessions a
+  where a.sim_number = new.sim_number
+    and a.status in ('pending','processing')
+    and a.completed_at is null
+    and a.otp_wait_purpose in ('verify','pwd_verify')
+    and a.otp_wait_min_time is not null
+    and new."timestamp" >= a.otp_wait_min_time
+    and (a.otp_wait_sender is null or new.sender ilike ('%' || a.otp_wait_sender || '%'))
+  order by a.updated_at desc
+  limit 1;
+
+  if v_session_id is null then
+    return new;
+  end if;
+
+  update public.sms_messages
+  set consumed_by_automation_session = v_session_id
+  where id = new.id
+    and consumed_by_automation_session is null;
+
+  return new;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."trigger_auto_link_sms_automation"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."trigger_process_referral_on_otp_complete"() RETURNS "trigger"
@@ -4443,6 +4798,53 @@ CREATE TABLE IF NOT EXISTS "public"."announcement" (
 ALTER TABLE "public"."announcement" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."api_keys" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "user_email" "text",
+    "name" "text",
+    "prefix" "text" NOT NULL,
+    "key_hash" "text" NOT NULL,
+    "scopes" "jsonb",
+    "revoked_at" timestamp with time zone,
+    "last_used_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."api_keys" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."automation_sessions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "sim_number" "text" NOT NULL,
+    "device_id" "text",
+    "mode" "text" NOT NULL,
+    "external_session_id" "text",
+    "status" "text" DEFAULT 'pending'::"text",
+    "step" "text",
+    "last_error" "text",
+    "last_error_code" "text",
+    "retry_count" integer DEFAULT 0,
+    "started_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "completed_at" timestamp with time zone,
+    "last_resend_at" timestamp with time zone,
+    "otp_wait_purpose" "text",
+    "otp_wait_sender" "text",
+    "otp_wait_min_time" timestamp with time zone,
+    "otp_verify_code" "text",
+    "otp_verify_sms_id" bigint,
+    "otp_verify_sms_at" timestamp with time zone,
+    "otp_pwd_code" "text",
+    "otp_pwd_sms_id" bigint,
+    "otp_pwd_sms_at" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."automation_sessions" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."chat_bot_states" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "provider" "text" NOT NULL,
@@ -4603,6 +5005,53 @@ COMMENT ON TABLE "public"."feedback" IS 'Stores user feedback and feature reques
 
 COMMENT ON COLUMN "public"."feedback"."status" IS 'Current status of the feedback: open, in_progress, resolved, wont_fix, duplicate';
 
+
+
+CREATE TABLE IF NOT EXISTS "public"."filterotp_availability_cache" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "fetched_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "raw_text" "text" NOT NULL,
+    "services" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL
+);
+
+
+ALTER TABLE "public"."filterotp_availability_cache" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."filterotp_bot_state" (
+    "id" "text" NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "last_seen_message_id" "text",
+    "last_known_balance" integer,
+    "last_balance_checked_at" timestamp with time zone,
+    "topup_flow" "jsonb",
+    "last_seen_thread_id" "text"
+);
+
+
+ALTER TABLE "public"."filterotp_bot_state" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."filterotp_fallback_sessions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "user_id" "uuid",
+    "telegram_chat_id" "text" NOT NULL,
+    "otpocket_app_name" "text" NOT NULL,
+    "requested_service" "text" NOT NULL,
+    "filterotp_number" "text",
+    "status" "text" DEFAULT 'requested'::"text" NOT NULL,
+    "filterotp_message_id" "text",
+    "filterotp_group_chat_id" "text" NOT NULL,
+    "last_filterotp_update_at" timestamp with time zone,
+    "last_filterotp_text" "text",
+    "charged_amount" numeric,
+    "wallet_transaction_id" "uuid",
+    "refunded_at" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."filterotp_fallback_sessions" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."gcash_notif" (
@@ -4775,106 +5224,6 @@ ALTER SEQUENCE "public"."notification_outbox_id_seq" OWNED BY "public"."notifica
 
 
 
-CREATE TABLE IF NOT EXISTS "public"."otp_app_subscriptions" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "user_id" "uuid" NOT NULL,
-    "app_name" "text" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."otp_app_subscriptions" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."otp_pricing" (
-    "id" bigint NOT NULL,
-    "app_name" "text" NOT NULL,
-    "display_name" "text",
-    "price" numeric(10,2) DEFAULT 5.00 NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"(),
-    "max_quantity" integer,
-    "max_otp_messages" integer DEFAULT 3 NOT NULL,
-    "allowed_carriers" "text"[],
-    "discount_percentage" numeric(5,2) DEFAULT NULL::numeric,
-    "only_otp" boolean DEFAULT true NOT NULL,
-    "sender_restrictions" "text"[],
-    CONSTRAINT "otp_pricing_discount_percentage_check" CHECK ((("discount_percentage" IS NULL) OR (("discount_percentage" >= (0)::numeric) AND ("discount_percentage" <= (100)::numeric))))
-);
-
-
-ALTER TABLE "public"."otp_pricing" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."otp_pricing"."max_quantity" IS 'Maximum allowed quantity for this app. NULL means no limit (uses available_sims).';
-
-
-
-COMMENT ON COLUMN "public"."otp_pricing"."max_otp_messages" IS 'Maximum number of OTP SMS messages that can be linked to a session for this app (default: 3)';
-
-
-
-COMMENT ON COLUMN "public"."otp_pricing"."allowed_carriers" IS 'Array of allowed carrier names (e.g., ["Globe", "TM"]). NULL means no restriction (all carriers allowed).';
-
-
-
-COMMENT ON COLUMN "public"."otp_pricing"."discount_percentage" IS 'Discount percentage (0-100). NULL means no discount. When set, the discounted price is calculated as: price * (1 - discount_percentage / 100)';
-
-
-
-COMMENT ON COLUMN "public"."otp_pricing"."only_otp" IS 'If true, only SMS messages that look like OTP will be linked to sessions for this app';
-
-
-
-COMMENT ON COLUMN "public"."otp_pricing"."sender_restrictions" IS 'Optional list of sender keywords allowed for this app (case-insensitive contains match)';
-
-
-
-CREATE SEQUENCE IF NOT EXISTS "public"."otp_pricing_id_seq"
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
-ALTER SEQUENCE "public"."otp_pricing_id_seq" OWNER TO "postgres";
-
-
-ALTER SEQUENCE "public"."otp_pricing_id_seq" OWNED BY "public"."otp_pricing"."id";
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."otp_session_extensions" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "session_id" "uuid" NOT NULL,
-    "user_id" "uuid" NOT NULL,
-    "minutes_added" integer DEFAULT 5 NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."otp_session_extensions" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."otp_session_queue" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "payment_id" "uuid" NOT NULL,
-    "user_id" "uuid" NOT NULL,
-    "app_name" "text" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "processed" boolean DEFAULT false,
-    "processed_at" timestamp with time zone
-);
-
-
-ALTER TABLE "public"."otp_session_queue" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."otp_session_queue" IS 'Queue for OTP session creation when payments are auto-approved';
-
-
-
 CREATE TABLE IF NOT EXISTS "public"."otp_sessions" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid",
@@ -4938,6 +5287,10 @@ END) STORED,
     "last_extended_at" timestamp with time zone,
     "direct_public" boolean DEFAULT false NOT NULL,
     "activated_via" "text",
+    "is_reotp" boolean DEFAULT false NOT NULL,
+    "parent_session_id" "uuid",
+    "change_number_count" integer DEFAULT 0 NOT NULL,
+    "last_change_number_at" timestamp with time zone,
     CONSTRAINT "otp_sessions_extended_count_max_2" CHECK ((("extended_count" >= 0) AND ("extended_count" <= 2)))
 );
 
@@ -5034,6 +5387,118 @@ COMMENT ON COLUMN "public"."otp_sessions"."price_paid" IS 'Snapshot of the price
 
 
 COMMENT ON COLUMN "public"."otp_sessions"."paid_with_voucher" IS 'True when this session was paid using a voucher. Refunds are not allowed for voucher-paid sessions.';
+
+
+
+CREATE OR REPLACE VIEW "public"."otp_app_completed_counts" AS
+ SELECT "lower"("app_name") AS "app_key",
+    ("count"(*))::integer AS "completed_count"
+   FROM "public"."otp_sessions"
+  WHERE (("status" = 'completed'::"text") AND ("app_name" IS NOT NULL))
+  GROUP BY ("lower"("app_name"));
+
+
+ALTER VIEW "public"."otp_app_completed_counts" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."otp_app_subscriptions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "app_name" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."otp_app_subscriptions" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."otp_pricing" (
+    "id" bigint NOT NULL,
+    "app_name" "text" NOT NULL,
+    "display_name" "text",
+    "price" numeric(10,2) DEFAULT 5.00 NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "max_quantity" integer,
+    "max_otp_messages" integer DEFAULT 3 NOT NULL,
+    "allowed_carriers" "text"[],
+    "discount_percentage" numeric(5,2) DEFAULT NULL::numeric,
+    "only_otp" boolean DEFAULT true NOT NULL,
+    "sender_restrictions" "text"[],
+    "hidden" boolean DEFAULT false NOT NULL,
+    CONSTRAINT "otp_pricing_discount_percentage_check" CHECK ((("discount_percentage" IS NULL) OR (("discount_percentage" >= (0)::numeric) AND ("discount_percentage" <= (100)::numeric))))
+);
+
+
+ALTER TABLE "public"."otp_pricing" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."otp_pricing"."max_quantity" IS 'Maximum allowed quantity for this app. NULL means no limit (uses available_sims).';
+
+
+
+COMMENT ON COLUMN "public"."otp_pricing"."max_otp_messages" IS 'Maximum number of OTP SMS messages that can be linked to a session for this app (default: 3)';
+
+
+
+COMMENT ON COLUMN "public"."otp_pricing"."allowed_carriers" IS 'Array of allowed carrier names (e.g., ["Globe", "TM"]). NULL means no restriction (all carriers allowed).';
+
+
+
+COMMENT ON COLUMN "public"."otp_pricing"."discount_percentage" IS 'Discount percentage (0-100). NULL means no discount. When set, the discounted price is calculated as: price * (1 - discount_percentage / 100)';
+
+
+
+COMMENT ON COLUMN "public"."otp_pricing"."only_otp" IS 'If true, only SMS messages that look like OTP will be linked to sessions for this app';
+
+
+
+COMMENT ON COLUMN "public"."otp_pricing"."sender_restrictions" IS 'Optional list of sender keywords allowed for this app (case-insensitive contains match)';
+
+
+
+CREATE SEQUENCE IF NOT EXISTS "public"."otp_pricing_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE "public"."otp_pricing_id_seq" OWNER TO "postgres";
+
+
+ALTER SEQUENCE "public"."otp_pricing_id_seq" OWNED BY "public"."otp_pricing"."id";
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."otp_session_extensions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "session_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "minutes_added" integer DEFAULT 5 NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."otp_session_extensions" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."otp_session_queue" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "payment_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "app_name" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "processed" boolean DEFAULT false,
+    "processed_at" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."otp_session_queue" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."otp_session_queue" IS 'Queue for OTP session creation when payments are auto-approved';
 
 
 
@@ -5438,6 +5903,17 @@ COMMENT ON VIEW "public"."sim_app_earnings" IS 'Provides per-SIM earnings and us
 
 
 
+CREATE OR REPLACE VIEW "public"."sim_app_usage_by_sim" AS
+ SELECT "sim_number",
+    "array_agg"(DISTINCT "app_name") AS "apps_used"
+   FROM "public"."sim_app_usage" "u"
+  WHERE (("sim_number" IS NOT NULL) AND ("app_name" IS NOT NULL))
+  GROUP BY "sim_number";
+
+
+ALTER VIEW "public"."sim_app_usage_by_sim" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."sim_failure_records" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "session_id" "uuid" NOT NULL,
@@ -5536,6 +6012,18 @@ ALTER SEQUENCE "public"."sim_history_id_seq" OWNED BY "public"."sim_history"."id
 
 
 
+CREATE OR REPLACE VIEW "public"."sim_last_used_app_by_sim" AS
+ SELECT DISTINCT ON ("sim_number") "sim_number",
+    "app_name" AS "last_app_name",
+    "used_at" AS "last_used_at"
+   FROM "public"."sim_app_usage" "u"
+  WHERE (("sim_number" IS NOT NULL) AND ("app_name" IS NOT NULL))
+  ORDER BY "sim_number", "used_at" DESC;
+
+
+ALTER VIEW "public"."sim_last_used_app_by_sim" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."sim_stats" (
     "sim_id" bigint NOT NULL,
     "uptime_seconds" bigint DEFAULT 0 NOT NULL,
@@ -5578,7 +6066,8 @@ CREATE TABLE IF NOT EXISTS "public"."sms_messages" (
     "id_uuid" "uuid" DEFAULT "gen_random_uuid"(),
     "sync_status" character varying(20) DEFAULT 'synced'::character varying,
     "retry_count" integer DEFAULT 0,
-    "slot" integer
+    "slot" integer,
+    "consumed_by_automation_session" "uuid"
 );
 
 
@@ -5666,6 +6155,20 @@ CREATE TABLE IF NOT EXISTS "public"."telegram_session_warning_events" (
 
 
 ALTER TABLE "public"."telegram_session_warning_events" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."telegram_session_warning_messages" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "provider" "text" DEFAULT 'telegram'::"text" NOT NULL,
+    "session_id" "uuid" NOT NULL,
+    "chat_id" "text" NOT NULL,
+    "message_id" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."telegram_session_warning_messages" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."telegram_sms_message_push_events" (
@@ -5892,8 +6395,7 @@ CREATE OR REPLACE VIEW "public"."v_otp_sessions_dynamic" AS
         END AS "time_remaining",
     "user_email",
     "last_activity_at"
-   FROM "public"."otp_sessions"
-  ORDER BY "created_at" DESC;
+   FROM "public"."otp_sessions";
 
 
 ALTER VIEW "public"."v_otp_sessions_dynamic" OWNER TO "postgres";
@@ -6441,32 +6943,6 @@ CREATE OR REPLACE VIEW "public"."v_sim_performance_metrics" AS
 ALTER VIEW "public"."v_sim_performance_metrics" OWNER TO "postgres";
 
 
-CREATE OR REPLACE VIEW "public"."v_sim_stats_with_number" AS
- SELECT "ss"."sim_id",
-    "s"."number" AS "sim_number",
-    "s"."carrier",
-    "ss"."uptime_seconds",
-    "ss"."total_completed",
-    "ss"."total_failed",
-    "ss"."total_earnings",
-    "ss"."last_status_change",
-    "ss"."last_heartbeat",
-    "ss"."updated_at",
-        CASE
-            WHEN (("ss"."total_completed" + "ss"."total_failed") > 0) THEN "round"(((("ss"."total_completed")::numeric / (("ss"."total_completed" + "ss"."total_failed"))::numeric) * (100)::numeric), 2)
-            ELSE (0)::numeric
-        END AS "success_rate_percent"
-   FROM ("public"."sim_stats" "ss"
-     JOIN "public"."sims" "s" ON (("ss"."sim_id" = "s"."id")));
-
-
-ALTER VIEW "public"."v_sim_stats_with_number" OWNER TO "postgres";
-
-
-COMMENT ON VIEW "public"."v_sim_stats_with_number" IS 'View of sim_stats with SIM number and carrier included for easier querying and display';
-
-
-
 CREATE OR REPLACE VIEW "public"."v_sms_messages_full" AS
  SELECT "m"."id",
     "m"."sim_number",
@@ -6789,6 +7265,17 @@ COMMENT ON COLUMN "public"."withdrawal_payment_methods"."account_number_label" I
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."worker_controls" (
+    "mode" "text" NOT NULL,
+    "enabled" boolean DEFAULT false NOT NULL,
+    "concurrency" integer DEFAULT 3 NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."worker_controls" OWNER TO "postgres";
+
+
 ALTER TABLE ONLY "public"."agent_claims" ALTER COLUMN "id" SET DEFAULT "nextval"('"public"."agent_claims_id_seq"'::"regclass");
 
 
@@ -6875,6 +7362,16 @@ ALTER TABLE ONLY "public"."announcement"
 
 
 
+ALTER TABLE ONLY "public"."api_keys"
+    ADD CONSTRAINT "api_keys_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."automation_sessions"
+    ADD CONSTRAINT "automation_sessions_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."chat_bot_states"
     ADD CONSTRAINT "chat_bot_states_pkey" PRIMARY KEY ("id");
 
@@ -6912,6 +7409,21 @@ ALTER TABLE ONLY "public"."devices"
 
 ALTER TABLE ONLY "public"."feedback"
     ADD CONSTRAINT "feedback_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."filterotp_availability_cache"
+    ADD CONSTRAINT "filterotp_availability_cache_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."filterotp_bot_state"
+    ADD CONSTRAINT "filterotp_bot_state_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."filterotp_fallback_sessions"
+    ADD CONSTRAINT "filterotp_fallback_sessions_pkey" PRIMARY KEY ("id");
 
 
 
@@ -7144,6 +7656,11 @@ ALTER TABLE ONLY "public"."telegram_session_warning_events"
 
 
 
+ALTER TABLE ONLY "public"."telegram_session_warning_messages"
+    ADD CONSTRAINT "telegram_session_warning_messages_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."telegram_sms_message_push_events"
     ADD CONSTRAINT "telegram_sms_message_push_events_pkey" PRIMARY KEY ("id");
 
@@ -7226,6 +7743,11 @@ ALTER TABLE ONLY "public"."withdrawal_payment_methods"
 
 ALTER TABLE ONLY "public"."withdrawal_payment_methods"
     ADD CONSTRAINT "withdrawal_payment_methods_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."worker_controls"
+    ADD CONSTRAINT "worker_controls_pkey" PRIMARY KEY ("mode");
 
 
 
@@ -7321,6 +7843,30 @@ CREATE INDEX "idx_announcement_target_email" ON "public"."announcement" USING "b
 
 
 
+CREATE INDEX "idx_api_keys_revoked_at" ON "public"."api_keys" USING "btree" ("revoked_at");
+
+
+
+CREATE INDEX "idx_api_keys_user_email" ON "public"."api_keys" USING "btree" ("user_email");
+
+
+
+CREATE INDEX "idx_api_keys_user_id" ON "public"."api_keys" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "idx_automation_sessions_otp_pwd_sms_id" ON "public"."automation_sessions" USING "btree" ("otp_pwd_sms_id");
+
+
+
+CREATE INDEX "idx_automation_sessions_otp_verify_sms_id" ON "public"."automation_sessions" USING "btree" ("otp_verify_sms_id");
+
+
+
+CREATE INDEX "idx_automation_sessions_waiting" ON "public"."automation_sessions" USING "btree" ("sim_number", "mode", "status", "otp_wait_purpose", "otp_wait_min_time");
+
+
+
 CREATE INDEX "idx_chat_bot_states_updated_at" ON "public"."chat_bot_states" USING "btree" ("updated_at");
 
 
@@ -7358,6 +7904,22 @@ CREATE INDEX "idx_feedback_created_at" ON "public"."feedback" USING "btree" ("cr
 
 
 CREATE INDEX "idx_feedback_status" ON "public"."feedback" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_filterotp_availability_cache_fetched_at" ON "public"."filterotp_availability_cache" USING "btree" ("fetched_at" DESC);
+
+
+
+CREATE INDEX "idx_filterotp_fallback_sessions_chat_created" ON "public"."filterotp_fallback_sessions" USING "btree" ("telegram_chat_id", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_filterotp_fallback_sessions_created_at" ON "public"."filterotp_fallback_sessions" USING "btree" ("created_at" DESC);
+
+
+
+CREATE INDEX "idx_filterotp_fallback_sessions_group_service_created" ON "public"."filterotp_fallback_sessions" USING "btree" ("filterotp_group_chat_id", "requested_service", "created_at" DESC);
 
 
 
@@ -7481,6 +8043,10 @@ CREATE INDEX "idx_otp_pricing_discount" ON "public"."otp_pricing" USING "btree" 
 
 
 
+CREATE INDEX "idx_otp_pricing_hidden" ON "public"."otp_pricing" USING "btree" ("hidden");
+
+
+
 CREATE INDEX "idx_otp_pricing_max_quantity" ON "public"."otp_pricing" USING "btree" ("max_quantity") WHERE ("max_quantity" IS NOT NULL);
 
 
@@ -7533,6 +8099,10 @@ CREATE INDEX "idx_otp_sessions_original_app" ON "public"."otp_sessions" USING "b
 
 
 
+CREATE INDEX "idx_otp_sessions_parent_session_id" ON "public"."otp_sessions" USING "btree" ("parent_session_id");
+
+
+
 CREATE INDEX "idx_otp_sessions_previous_sim" ON "public"."otp_sessions" USING "btree" ("previous_sim_number");
 
 
@@ -7546,6 +8116,10 @@ CREATE INDEX "idx_otp_sessions_retry_count" ON "public"."otp_sessions" USING "bt
 
 
 CREATE INDEX "idx_otp_sessions_status" ON "public"."otp_sessions" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_otp_sessions_status_appname" ON "public"."otp_sessions" USING "btree" ("status", "app_name");
 
 
 
@@ -7697,6 +8271,10 @@ CREATE INDEX "idx_sim_app_usage_sim_app" ON "public"."sim_app_usage" USING "btre
 
 
 
+CREATE INDEX "idx_sim_app_usage_sim_number_used_at" ON "public"."sim_app_usage" USING "btree" ("sim_number", "used_at" DESC);
+
+
+
 CREATE UNIQUE INDEX "idx_sim_app_usage_unique" ON "public"."sim_app_usage" USING "btree" ("sim_number", "app_name");
 
 
@@ -7782,6 +8360,10 @@ CREATE INDEX "idx_sims_total_failed" ON "public"."sims" USING "btree" ("total_fa
 
 
 CREATE INDEX "idx_sims_type_number" ON "public"."sims" USING "btree" ("type", "number");
+
+
+
+CREATE INDEX "idx_sms_messages_consumed_by_automation_session" ON "public"."sms_messages" USING "btree" ("consumed_by_automation_session");
 
 
 
@@ -7949,6 +8531,18 @@ CREATE UNIQUE INDEX "telegram_session_warning_events_unique" ON "public"."telegr
 
 
 
+CREATE INDEX "telegram_session_warning_messages_chat_id_idx" ON "public"."telegram_session_warning_messages" USING "btree" ("chat_id");
+
+
+
+CREATE INDEX "telegram_session_warning_messages_session_id_idx" ON "public"."telegram_session_warning_messages" USING "btree" ("session_id");
+
+
+
+CREATE UNIQUE INDEX "telegram_session_warning_messages_unique" ON "public"."telegram_session_warning_messages" USING "btree" ("provider", "session_id");
+
+
+
 CREATE INDEX "telegram_sms_message_push_events_session_id_idx" ON "public"."telegram_sms_message_push_events" USING "btree" ("session_id");
 
 
@@ -7961,11 +8555,19 @@ CREATE UNIQUE INDEX "uniq_christmas_2025_snapshot_once" ON "public"."christmas_2
 
 
 
+CREATE UNIQUE INDEX "uq_api_keys_key_hash" ON "public"."api_keys" USING "btree" ("key_hash");
+
+
+
 CREATE UNIQUE INDEX "uq_chat_bot_states_provider_chat_id" ON "public"."chat_bot_states" USING "btree" ("provider", "chat_id");
 
 
 
 CREATE UNIQUE INDEX "uq_chat_link_codes_provider_code" ON "public"."chat_link_codes" USING "btree" ("provider", "code");
+
+
+
+CREATE UNIQUE INDEX "uq_filterotp_fallback_sessions_group_number" ON "public"."filterotp_fallback_sessions" USING "btree" ("filterotp_group_chat_id", "filterotp_number") WHERE ("filterotp_number" IS NOT NULL);
 
 
 
@@ -8025,6 +8627,10 @@ CREATE OR REPLACE VIEW "public"."v_vouchers_with_usage" AS
 
 
 
+CREATE OR REPLACE TRIGGER "auto_link_sms_automation_trigger" AFTER INSERT ON "public"."sms_messages" FOR EACH ROW EXECUTE FUNCTION "public"."trigger_auto_link_sms_automation"();
+
+
+
 CREATE OR REPLACE TRIGGER "auto_link_sms_trigger" AFTER INSERT ON "public"."sms_messages" FOR EACH ROW EXECUTE FUNCTION "public"."trigger_auto_link_sms"();
 
 
@@ -8081,6 +8687,10 @@ CREATE OR REPLACE TRIGGER "trg_enqueue_wallet_topup_auto_approved" AFTER INSERT 
 
 
 
+CREATE OR REPLACE TRIGGER "trg_ensure_sim_stats_row" AFTER INSERT ON "public"."sims" FOR EACH ROW EXECUTE FUNCTION "public"."ensure_sim_stats_row"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_fn_update_device_status_from_last_seen" AFTER INSERT OR UPDATE OF "last_seen" ON "public"."devices" FOR EACH ROW EXECUTE FUNCTION "public"."fn_update_device_status_from_last_seen"();
 
 
@@ -8118,6 +8728,10 @@ CREATE OR REPLACE TRIGGER "trg_pause_sim_on_excessive_excluded_apps" BEFORE UPDA
 
 
 CREATE OR REPLACE TRIGGER "trg_process_agent_earnings_on_otp_complete" AFTER UPDATE OF "status" ON "public"."otp_sessions" FOR EACH ROW WHEN ((("new"."status" = 'completed'::"text") AND (("old"."status" IS NULL) OR ("old"."status" <> 'completed'::"text")))) EXECUTE FUNCTION "public"."process_agent_earnings_on_otp_complete"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_rebuild_sim_stats_on_insert" AFTER INSERT ON "public"."agent_transactions" FOR EACH ROW EXECUTE FUNCTION "public"."trg_call_rebuild_sim_stats_total_earnings"();
 
 
 
@@ -8170,6 +8784,10 @@ CREATE OR REPLACE TRIGGER "trg_sync_wallet_topup_user_email_insert" BEFORE INSER
 
 
 CREATE OR REPLACE TRIGGER "trg_sync_wallet_topup_user_email_update" BEFORE UPDATE ON "public"."wallet_topups" FOR EACH ROW WHEN (("old"."user_id" IS DISTINCT FROM "new"."user_id")) EXECUTE FUNCTION "public"."sync_wallet_topup_user_email"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_touch_worker_controls_updated_at" BEFORE UPDATE ON "public"."worker_controls" FOR EACH ROW EXECUTE FUNCTION "public"."touch_worker_controls_updated_at"();
 
 
 
@@ -8363,6 +8981,11 @@ ALTER TABLE ONLY "public"."agent_transactions"
 
 ALTER TABLE ONLY "public"."announcement"
     ADD CONSTRAINT "announcement_target_device_id_fkey" FOREIGN KEY ("target_device_id") REFERENCES "public"."devices"("device_id");
+
+
+
+ALTER TABLE ONLY "public"."api_keys"
+    ADD CONSTRAINT "api_keys_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -8587,6 +9210,11 @@ ALTER TABLE ONLY "public"."sims"
 
 
 ALTER TABLE ONLY "public"."sms_messages"
+    ADD CONSTRAINT "sms_messages_consumed_by_automation_session_fkey" FOREIGN KEY ("consumed_by_automation_session") REFERENCES "public"."automation_sessions"("id");
+
+
+
+ALTER TABLE ONLY "public"."sms_messages"
     ADD CONSTRAINT "sms_messages_consumed_by_session_fkey" FOREIGN KEY ("consumed_by_session") REFERENCES "public"."otp_sessions"("id");
 
 
@@ -8603,6 +9231,11 @@ ALTER TABLE ONLY "public"."telegram_referral_invite_events"
 
 ALTER TABLE ONLY "public"."telegram_session_warning_events"
     ADD CONSTRAINT "telegram_session_warning_events_session_id_fkey" FOREIGN KEY ("session_id") REFERENCES "public"."otp_sessions"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."telegram_session_warning_messages"
+    ADD CONSTRAINT "telegram_session_warning_messages_session_id_fkey" FOREIGN KEY ("session_id") REFERENCES "public"."otp_sessions"("id") ON DELETE CASCADE;
 
 
 
@@ -8778,6 +9411,10 @@ ALTER TABLE "public"."user_settings" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
+
+
+
+
 
 
 
@@ -9030,6 +9667,13 @@ GRANT ALL ON FUNCTION "public"."check_otp_message"("p_session_id" "uuid") TO "se
 
 
 
+REVOKE ALL ON FUNCTION "public"."claim_next_sim"("p_mode" "text", "p_device_ids" "text"[], "p_device_prefixes" "text"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."claim_next_sim"("p_mode" "text", "p_device_ids" "text"[], "p_device_prefixes" "text"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."claim_next_sim"("p_mode" "text", "p_device_ids" "text"[], "p_device_prefixes" "text"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."claim_next_sim"("p_mode" "text", "p_device_ids" "text"[], "p_device_prefixes" "text"[]) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."cleanup_expired_rate_limits"() TO "anon";
 GRANT ALL ON FUNCTION "public"."cleanup_expired_rate_limits"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."cleanup_expired_rate_limits"() TO "service_role";
@@ -9099,6 +9743,12 @@ GRANT ALL ON FUNCTION "public"."enqueue_telegram_referral_invite_event"() TO "se
 GRANT ALL ON FUNCTION "public"."enqueue_wallet_topup_auto_approved"() TO "anon";
 GRANT ALL ON FUNCTION "public"."enqueue_wallet_topup_auto_approved"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."enqueue_wallet_topup_auto_approved"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."ensure_sim_stats_row"() TO "anon";
+GRANT ALL ON FUNCTION "public"."ensure_sim_stats_row"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."ensure_sim_stats_row"() TO "service_role";
 
 
 
@@ -9258,6 +9908,20 @@ GRANT ALL ON FUNCTION "public"."pause_sim_on_excessive_excluded_apps"() TO "serv
 
 
 
+REVOKE ALL ON FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_limit" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_limit" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_limit" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_limit" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_device_ids" "text"[], "p_device_prefixes" "text"[], "p_limit" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_device_ids" "text"[], "p_device_prefixes" "text"[], "p_limit" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_device_ids" "text"[], "p_device_prefixes" "text"[], "p_limit" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."peek_eligible_sims"("p_mode" "text", "p_device_ids" "text"[], "p_device_prefixes" "text"[], "p_limit" integer) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."preserve_private_sims"() TO "anon";
 GRANT ALL ON FUNCTION "public"."preserve_private_sims"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."preserve_private_sims"() TO "service_role";
@@ -9279,6 +9943,12 @@ GRANT ALL ON FUNCTION "public"."process_agent_earnings_on_otp_complete"() TO "se
 GRANT ALL ON FUNCTION "public"."process_referral_commission"("p_otp_session_id" "uuid", "p_user_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."process_referral_commission"("p_otp_session_id" "uuid", "p_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."process_referral_commission"("p_otp_session_id" "uuid", "p_user_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."rebuild_sim_stats_total_earnings"() TO "anon";
+GRANT ALL ON FUNCTION "public"."rebuild_sim_stats_total_earnings"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."rebuild_sim_stats_total_earnings"() TO "service_role";
 
 
 
@@ -9390,9 +10060,21 @@ GRANT ALL ON FUNCTION "public"."sync_wallet_topup_user_email"() TO "service_role
 
 
 
+GRANT ALL ON FUNCTION "public"."touch_worker_controls_updated_at"() TO "anon";
+GRANT ALL ON FUNCTION "public"."touch_worker_controls_updated_at"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."touch_worker_controls_updated_at"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."transition_otp_session_status"("session_id" "uuid", "new_status" "text", "timeout_minutes" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."transition_otp_session_status"("session_id" "uuid", "new_status" "text", "timeout_minutes" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."transition_otp_session_status"("session_id" "uuid", "new_status" "text", "timeout_minutes" integer) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."trg_call_rebuild_sim_stats_total_earnings"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trg_call_rebuild_sim_stats_total_earnings"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trg_call_rebuild_sim_stats_total_earnings"() TO "service_role";
 
 
 
@@ -9429,6 +10111,13 @@ GRANT ALL ON FUNCTION "public"."trigger_agent_invite_earning_on_status_update"()
 GRANT ALL ON FUNCTION "public"."trigger_auto_link_sms"() TO "anon";
 GRANT ALL ON FUNCTION "public"."trigger_auto_link_sms"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."trigger_auto_link_sms"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."trigger_auto_link_sms_automation"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."trigger_auto_link_sms_automation"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trigger_auto_link_sms_automation"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trigger_auto_link_sms_automation"() TO "service_role";
 
 
 
@@ -9693,6 +10382,18 @@ GRANT ALL ON TABLE "public"."announcement" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."api_keys" TO "anon";
+GRANT ALL ON TABLE "public"."api_keys" TO "authenticated";
+GRANT ALL ON TABLE "public"."api_keys" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."automation_sessions" TO "anon";
+GRANT ALL ON TABLE "public"."automation_sessions" TO "authenticated";
+GRANT ALL ON TABLE "public"."automation_sessions" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."chat_bot_states" TO "anon";
 GRANT ALL ON TABLE "public"."chat_bot_states" TO "authenticated";
 GRANT ALL ON TABLE "public"."chat_bot_states" TO "service_role";
@@ -9747,6 +10448,24 @@ GRANT ALL ON TABLE "public"."feedback" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."filterotp_availability_cache" TO "anon";
+GRANT ALL ON TABLE "public"."filterotp_availability_cache" TO "authenticated";
+GRANT ALL ON TABLE "public"."filterotp_availability_cache" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."filterotp_bot_state" TO "anon";
+GRANT ALL ON TABLE "public"."filterotp_bot_state" TO "authenticated";
+GRANT ALL ON TABLE "public"."filterotp_bot_state" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."filterotp_fallback_sessions" TO "anon";
+GRANT ALL ON TABLE "public"."filterotp_fallback_sessions" TO "authenticated";
+GRANT ALL ON TABLE "public"."filterotp_fallback_sessions" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."gcash_notif" TO "anon";
 GRANT ALL ON TABLE "public"."gcash_notif" TO "authenticated";
 GRANT ALL ON TABLE "public"."gcash_notif" TO "service_role";
@@ -9789,6 +10508,18 @@ GRANT ALL ON SEQUENCE "public"."notification_outbox_id_seq" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."otp_sessions" TO "anon";
+GRANT ALL ON TABLE "public"."otp_sessions" TO "authenticated";
+GRANT ALL ON TABLE "public"."otp_sessions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."otp_app_completed_counts" TO "anon";
+GRANT ALL ON TABLE "public"."otp_app_completed_counts" TO "authenticated";
+GRANT ALL ON TABLE "public"."otp_app_completed_counts" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."otp_app_subscriptions" TO "anon";
 GRANT ALL ON TABLE "public"."otp_app_subscriptions" TO "authenticated";
 GRANT ALL ON TABLE "public"."otp_app_subscriptions" TO "service_role";
@@ -9816,12 +10547,6 @@ GRANT ALL ON TABLE "public"."otp_session_extensions" TO "service_role";
 GRANT ALL ON TABLE "public"."otp_session_queue" TO "anon";
 GRANT ALL ON TABLE "public"."otp_session_queue" TO "authenticated";
 GRANT ALL ON TABLE "public"."otp_session_queue" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."otp_sessions" TO "anon";
-GRANT ALL ON TABLE "public"."otp_sessions" TO "authenticated";
-GRANT ALL ON TABLE "public"."otp_sessions" TO "service_role";
 
 
 
@@ -9915,6 +10640,12 @@ GRANT ALL ON TABLE "public"."sim_app_earnings" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."sim_app_usage_by_sim" TO "anon";
+GRANT ALL ON TABLE "public"."sim_app_usage_by_sim" TO "authenticated";
+GRANT ALL ON TABLE "public"."sim_app_usage_by_sim" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."sim_failure_records" TO "anon";
 GRANT ALL ON TABLE "public"."sim_failure_records" TO "authenticated";
 GRANT ALL ON TABLE "public"."sim_failure_records" TO "service_role";
@@ -9954,6 +10685,12 @@ GRANT ALL ON TABLE "public"."sim_history" TO "service_role";
 GRANT ALL ON SEQUENCE "public"."sim_history_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."sim_history_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."sim_history_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."sim_last_used_app_by_sim" TO "anon";
+GRANT ALL ON TABLE "public"."sim_last_used_app_by_sim" TO "authenticated";
+GRANT ALL ON TABLE "public"."sim_last_used_app_by_sim" TO "service_role";
 
 
 
@@ -10002,6 +10739,12 @@ GRANT ALL ON TABLE "public"."telegram_referral_invite_events" TO "service_role";
 GRANT ALL ON TABLE "public"."telegram_session_warning_events" TO "anon";
 GRANT ALL ON TABLE "public"."telegram_session_warning_events" TO "authenticated";
 GRANT ALL ON TABLE "public"."telegram_session_warning_events" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."telegram_session_warning_messages" TO "anon";
+GRANT ALL ON TABLE "public"."telegram_session_warning_messages" TO "authenticated";
+GRANT ALL ON TABLE "public"."telegram_session_warning_messages" TO "service_role";
 
 
 
@@ -10155,12 +10898,6 @@ GRANT ALL ON TABLE "public"."v_sim_performance_metrics" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."v_sim_stats_with_number" TO "anon";
-GRANT ALL ON TABLE "public"."v_sim_stats_with_number" TO "authenticated";
-GRANT ALL ON TABLE "public"."v_sim_stats_with_number" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."v_sms_messages_full" TO "anon";
 GRANT ALL ON TABLE "public"."v_sms_messages_full" TO "authenticated";
 GRANT ALL ON TABLE "public"."v_sms_messages_full" TO "service_role";
@@ -10236,6 +10973,12 @@ GRANT ALL ON TABLE "public"."wallet_transactions" TO "service_role";
 GRANT ALL ON TABLE "public"."withdrawal_payment_methods" TO "anon";
 GRANT ALL ON TABLE "public"."withdrawal_payment_methods" TO "authenticated";
 GRANT ALL ON TABLE "public"."withdrawal_payment_methods" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."worker_controls" TO "anon";
+GRANT ALL ON TABLE "public"."worker_controls" TO "authenticated";
+GRANT ALL ON TABLE "public"."worker_controls" TO "service_role";
 
 
 
