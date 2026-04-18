@@ -6394,7 +6394,8 @@ CREATE OR REPLACE VIEW "public"."v_otp_sessions_dynamic" AS
             ELSE 0
         END AS "time_remaining",
     "user_email",
-    "last_activity_at"
+    "last_activity_at",
+    "message_count"
    FROM "public"."otp_sessions";
 
 
