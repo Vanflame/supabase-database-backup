@@ -2272,8 +2272,7 @@ ALTER FUNCTION "public"."match_wallet_topup_with_gcash_notif"() OWNER TO "postgr
 
 CREATE OR REPLACE FUNCTION "public"."pause_sim_on_excessive_excluded_apps"() RETURNS "trigger"
     LANGUAGE "plpgsql"
-    AS $$
-DECLARE
+    AS $$DECLARE
   v_count integer;
   v_old_count integer;
 BEGIN
@@ -2281,10 +2280,10 @@ BEGIN
   v_old_count := COALESCE(jsonb_array_length(COALESCE(OLD.excluded_apps, '[]'::jsonb)), 0);
 
   -- Rule: >3 exclusions means not fresh -> pause
-  IF v_count > 3 THEN
+  IF v_count > 5 THEN
     -- Pause the SIM, but do not overwrite an existing pause reason that isn't this rule
     IF NEW.paused_reason IS NULL OR NEW.paused_reason = 'excluded_apps_over_limit' THEN
-      NEW.status := 'PAUSED';
+      NEW.status := 'DISABLED';
       NEW.paused_at := COALESCE(NEW.paused_at, now());
       NEW.paused_reason := 'excluded_apps_over_limit';
       NEW.paused_context := jsonb_build_object(
@@ -2324,8 +2323,7 @@ BEGIN
   END IF;
 
   RETURN NEW;
-END;
-$$;
+END;$$;
 
 
 ALTER FUNCTION "public"."pause_sim_on_excessive_excluded_apps"() OWNER TO "postgres";
@@ -3981,6 +3979,19 @@ $$;
 ALTER FUNCTION "public"."update_agent_commission_overrides_updated_at"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."update_batch_unlock_config_timestamp"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_batch_unlock_config_timestamp"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."update_contact_submissions_updated_at"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -4783,7 +4794,7 @@ CREATE TABLE IF NOT EXISTS "public"."announcement" (
     "target_device_id" "text",
     "is_active" boolean DEFAULT true NOT NULL,
     "priority" integer DEFAULT 0 NOT NULL,
-    "show_in_banner" boolean DEFAULT true NOT NULL,
+    "show_in_banner" boolean DEFAULT false NOT NULL,
     "show_in_notification" boolean DEFAULT true NOT NULL,
     "action_url" "text",
     "action_text" "text",
@@ -4843,6 +4854,25 @@ CREATE TABLE IF NOT EXISTS "public"."automation_sessions" (
 
 
 ALTER TABLE "public"."automation_sessions" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."batch_unlock_config" (
+    "id" integer DEFAULT 1 NOT NULL,
+    "target_per_sim" numeric(10,2) DEFAULT 36.00 NOT NULL,
+    "included_agent_ids" "uuid"[] DEFAULT '{}'::"uuid"[],
+    "included_agent_emails" "text"[] DEFAULT '{}'::"text"[],
+    "is_active" boolean DEFAULT true NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "single_config_row" CHECK (("id" = 1))
+);
+
+
+ALTER TABLE "public"."batch_unlock_config" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."batch_unlock_config" IS 'Configuration for batch unlock progress tracking';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."chat_bot_states" (
@@ -6420,6 +6450,91 @@ CREATE OR REPLACE VIEW "public"."v_app_availability" AS
 ALTER VIEW "public"."v_app_availability" OWNER TO "postgres";
 
 
+CREATE OR REPLACE VIEW "public"."v_sims_with_status" AS
+ SELECT "s"."id",
+    "s"."number",
+    "s"."carrier",
+    "s"."slot",
+    "s"."type",
+    "s"."device_id",
+    "s"."device_name",
+    "s"."updated_at",
+    "d"."status" AS "device_status",
+        CASE
+            WHEN ((("s"."status")::"text" = 'ACTIVE'::"text") AND ("d"."last_seen" IS NOT NULL) AND (("now"() - "d"."last_seen") < '00:05:00'::interval)) THEN 'active'::"text"
+            ELSE 'offline'::"text"
+        END AS "computed_status"
+   FROM ("public"."sims" "s"
+     LEFT JOIN "public"."devices" "d" ON (("s"."device_id" = "d"."device_id")));
+
+
+ALTER VIEW "public"."v_sims_with_status" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."v_batch_unlock_progress" AS
+ WITH "config" AS (
+         SELECT "batch_unlock_config"."target_per_sim",
+            "batch_unlock_config"."included_agent_ids",
+            "batch_unlock_config"."included_agent_emails",
+            "batch_unlock_config"."is_active",
+                CASE
+                    WHEN (("cardinality"("batch_unlock_config"."included_agent_ids") = 0) AND ("cardinality"("batch_unlock_config"."included_agent_emails") = 0)) THEN true
+                    ELSE false
+                END AS "use_all_agents"
+           FROM "public"."batch_unlock_config"
+          WHERE ("batch_unlock_config"."id" = 1)
+        ), "configured_agent_ids" AS (
+         SELECT DISTINCT "u"."id"
+           FROM ("config" "c_1"
+             CROSS JOIN "public"."users" "u")
+          WHERE (("u"."id" = ANY ("c_1"."included_agent_ids")) OR ("u"."email" = ANY ("c_1"."included_agent_emails")))
+        ), "total_sims" AS (
+         SELECT "count"(DISTINCT "v"."number") AS "sim_count"
+           FROM (("public"."v_sims_with_status" "v"
+             JOIN "public"."devices" "d" ON (("d"."device_id" = "v"."device_id")))
+             CROSS JOIN "config" "c_1")
+          WHERE (("v"."type" = 'private'::"text") AND ("v"."computed_status" = 'active'::"text") AND (("c_1"."use_all_agents" = true) OR ("d"."user_id" IN ( SELECT "configured_agent_ids"."id"
+                   FROM "configured_agent_ids"))))
+        ), "agent_earnings" AS (
+         SELECT COALESCE("sum"("ss"."total_earnings"), (0)::numeric) AS "total_earnings"
+           FROM (((("public"."v_sims_with_status" "v"
+             JOIN "public"."sims" "s" ON (("s"."number" = "v"."number")))
+             JOIN "public"."sim_stats" "ss" ON (("ss"."sim_id" = "s"."id")))
+             JOIN "public"."devices" "d" ON (("d"."device_id" = "v"."device_id")))
+             CROSS JOIN "config" "c_1")
+          WHERE (("v"."type" = 'private'::"text") AND ("v"."computed_status" = 'active'::"text") AND (("c_1"."use_all_agents" = true) OR ("d"."user_id" IN ( SELECT "configured_agent_ids"."id"
+                   FROM "configured_agent_ids"))))
+        ), "target_earnings" AS (
+         SELECT ("c_1"."target_per_sim" * ("ts_1"."sim_count")::numeric) AS "target_amount"
+           FROM "config" "c_1",
+            "total_sims" "ts_1"
+        )
+ SELECT "c"."is_active",
+    "c"."target_per_sim",
+    "ts"."sim_count" AS "total_sims",
+    "te"."target_amount" AS "target_earnings",
+    "ae"."total_earnings" AS "current_earnings",
+        CASE
+            WHEN ("te"."target_amount" > (0)::numeric) THEN LEAST((100)::numeric, "round"((("ae"."total_earnings" / "te"."target_amount") * (100)::numeric), 2))
+            ELSE (0)::numeric
+        END AS "progress_percentage",
+        CASE
+            WHEN ("te"."target_amount" > (0)::numeric) THEN GREATEST((0)::numeric, ("te"."target_amount" - "ae"."total_earnings"))
+            ELSE (0)::numeric
+        END AS "remaining_earnings"
+   FROM "config" "c",
+    "total_sims" "ts",
+    "target_earnings" "te",
+    "agent_earnings" "ae";
+
+
+ALTER VIEW "public"."v_batch_unlock_progress" OWNER TO "postgres";
+
+
+COMMENT ON VIEW "public"."v_batch_unlock_progress" IS 'View showing current progress towards next batch unlock based on agent earnings';
+
+
+
 CREATE OR REPLACE VIEW "public"."v_christmas_2025_uptime_leaderboard" AS
  WITH "event_cfg" AS (
          SELECT '2025-12-20 18:00:00'::timestamp without time zone AS "event_start_gmt8"
@@ -6756,27 +6871,6 @@ ALTER VIEW "public"."v_referral_stats" OWNER TO "postgres";
 
 COMMENT ON VIEW "public"."v_referral_stats" IS 'Aggregated referral statistics. Calculates referrals and earnings separately to prevent multiplication issues.';
 
-
-
-CREATE OR REPLACE VIEW "public"."v_sims_with_status" AS
- SELECT "s"."id",
-    "s"."number",
-    "s"."carrier",
-    "s"."slot",
-    "s"."type",
-    "s"."device_id",
-    "s"."device_name",
-    "s"."updated_at",
-    "d"."status" AS "device_status",
-        CASE
-            WHEN ((("s"."status")::"text" = 'ACTIVE'::"text") AND ("d"."last_seen" IS NOT NULL) AND (("now"() - "d"."last_seen") < '00:05:00'::interval)) THEN 'active'::"text"
-            ELSE 'offline'::"text"
-        END AS "computed_status"
-   FROM ("public"."sims" "s"
-     LEFT JOIN "public"."devices" "d" ON (("s"."device_id" = "d"."device_id")));
-
-
-ALTER VIEW "public"."v_sims_with_status" OWNER TO "postgres";
 
 
 CREATE OR REPLACE VIEW "public"."v_sim_activity_summary" AS
@@ -7373,6 +7467,11 @@ ALTER TABLE ONLY "public"."automation_sessions"
 
 
 
+ALTER TABLE ONLY "public"."batch_unlock_config"
+    ADD CONSTRAINT "batch_unlock_config_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."chat_bot_states"
     ADD CONSTRAINT "chat_bot_states_pkey" PRIMARY KEY ("id");
 
@@ -7865,6 +7964,10 @@ CREATE INDEX "idx_automation_sessions_otp_verify_sms_id" ON "public"."automation
 
 
 CREATE INDEX "idx_automation_sessions_waiting" ON "public"."automation_sessions" USING "btree" ("sim_number", "mode", "status", "otp_wait_purpose", "otp_wait_min_time");
+
+
+
+CREATE INDEX "idx_batch_unlock_config_active" ON "public"."batch_unlock_config" USING "btree" ("is_active");
 
 
 
@@ -8865,6 +8968,10 @@ CREATE OR REPLACE TRIGGER "trigger_update_agent_commission_config_updated_at" BE
 
 
 CREATE OR REPLACE TRIGGER "trigger_update_agent_commission_overrides_updated_at" BEFORE UPDATE ON "public"."agent_commission_overrides" FOR EACH ROW EXECUTE FUNCTION "public"."update_agent_commission_overrides_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "trigger_update_batch_unlock_config_timestamp" BEFORE UPDATE ON "public"."batch_unlock_config" FOR EACH ROW EXECUTE FUNCTION "public"."update_batch_unlock_config_timestamp"();
 
 
 
@@ -10158,6 +10265,12 @@ GRANT ALL ON FUNCTION "public"."update_agent_commission_overrides_updated_at"() 
 
 
 
+GRANT ALL ON FUNCTION "public"."update_batch_unlock_config_timestamp"() TO "anon";
+GRANT ALL ON FUNCTION "public"."update_batch_unlock_config_timestamp"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_batch_unlock_config_timestamp"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."update_contact_submissions_updated_at"() TO "anon";
 GRANT ALL ON FUNCTION "public"."update_contact_submissions_updated_at"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_contact_submissions_updated_at"() TO "service_role";
@@ -10392,6 +10505,12 @@ GRANT ALL ON TABLE "public"."api_keys" TO "service_role";
 GRANT ALL ON TABLE "public"."automation_sessions" TO "anon";
 GRANT ALL ON TABLE "public"."automation_sessions" TO "authenticated";
 GRANT ALL ON TABLE "public"."automation_sessions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."batch_unlock_config" TO "anon";
+GRANT ALL ON TABLE "public"."batch_unlock_config" TO "authenticated";
+GRANT ALL ON TABLE "public"."batch_unlock_config" TO "service_role";
 
 
 
@@ -10815,6 +10934,18 @@ GRANT ALL ON TABLE "public"."v_app_availability" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."v_sims_with_status" TO "anon";
+GRANT ALL ON TABLE "public"."v_sims_with_status" TO "authenticated";
+GRANT ALL ON TABLE "public"."v_sims_with_status" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."v_batch_unlock_progress" TO "anon";
+GRANT ALL ON TABLE "public"."v_batch_unlock_progress" TO "authenticated";
+GRANT ALL ON TABLE "public"."v_batch_unlock_progress" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."v_christmas_2025_uptime_leaderboard" TO "anon";
 GRANT ALL ON TABLE "public"."v_christmas_2025_uptime_leaderboard" TO "authenticated";
 GRANT ALL ON TABLE "public"."v_christmas_2025_uptime_leaderboard" TO "service_role";
@@ -10860,12 +10991,6 @@ GRANT ALL ON TABLE "public"."v_rate_limit_usage" TO "service_role";
 GRANT ALL ON TABLE "public"."v_referral_stats" TO "anon";
 GRANT ALL ON TABLE "public"."v_referral_stats" TO "authenticated";
 GRANT ALL ON TABLE "public"."v_referral_stats" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."v_sims_with_status" TO "anon";
-GRANT ALL ON TABLE "public"."v_sims_with_status" TO "authenticated";
-GRANT ALL ON TABLE "public"."v_sims_with_status" TO "service_role";
 
 
 
