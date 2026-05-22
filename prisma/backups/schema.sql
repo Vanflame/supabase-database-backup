@@ -31,13 +31,6 @@ COMMENT ON SCHEMA "public" IS 'standard public schema';
 
 
 
-CREATE EXTENSION IF NOT EXISTS "pg_graphql" WITH SCHEMA "graphql";
-
-
-
-
-
-
 CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" WITH SCHEMA "extensions";
 
 
@@ -222,6 +215,34 @@ END;$$;
 ALTER FUNCTION "public"."apply_sim_failure_streak_on_failure_record"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."apply_topup_fee"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+    v_fee_percentage DECIMAL(5,4) := 0.0000;
+BEGIN
+    -- Get fee_percentage from payment_methods
+    -- payment_method_id can be UUID string or method name like 'gcash'
+    SELECT COALESCE(pm.fee_percentage, 0.0000) INTO v_fee_percentage
+    FROM public.payment_methods pm
+    WHERE pm.id::text = NEW.payment_method_id
+       OR lower(pm.name) = lower(NEW.payment_method_id)
+    LIMIT 1;
+
+    -- Calculate fee (added on top, not deducted)
+    -- User receives the full 'amount' they requested
+    -- fee_amount is the extra charge on top
+    NEW.fee_amount := NEW.amount * v_fee_percentage;
+    NEW.net_amount := NEW.amount; -- User receives full amount
+
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."apply_topup_fee"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."assign_default_referrer_on_insert"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -248,6 +269,68 @@ COMMENT ON FUNCTION "public"."assign_default_referrer_on_insert"() IS 'Function 
 
 
 
+CREATE OR REPLACE FUNCTION "public"."auto_assign_rental_sim"("p_request_id" "uuid", "p_network_id" "uuid" DEFAULT NULL::"uuid") RETURNS "uuid"
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+  v_sim_id BIGINT;
+  v_sim_number VARCHAR(20);
+  v_tier_id UUID;
+  v_duration_hours INT;
+  v_user_id UUID;
+  v_session_id UUID;
+BEGIN
+  -- Get request details
+  SELECT r.user_id, r.tier_id, t.duration_hours
+  INTO v_user_id, v_tier_id, v_duration_hours
+  FROM rental_requests r
+  JOIN rental_tiers t ON t.id = r.tier_id
+  WHERE r.id = p_request_id;
+  
+  IF v_user_id IS NULL THEN
+    RETURN NULL;
+  END IF;
+  
+  -- Find available rental SIM
+  SELECT s.id, s.number INTO v_sim_id, v_sim_number
+  FROM sims s
+  WHERE s.type IN ('rental', 'dedicated')
+    AND s.status = 'ENABLED'
+    AND (p_network_id IS NULL OR s.carrier ILIKE (SELECT name FROM rental_networks WHERE id = p_network_id) || '%')
+    AND s.id NOT IN (
+      SELECT sim_id FROM rental_sessions 
+      WHERE status = 'active' AND sim_id IS NOT NULL
+    )
+  ORDER BY random()
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED;
+  
+  IF v_sim_id IS NULL THEN
+    RETURN NULL; -- No SIM available
+  END IF;
+  
+  -- Create session
+  INSERT INTO rental_sessions (
+    user_id, request_id, sim_id, number, network_id, tier_id,
+    started_at, expires_at, status
+  ) VALUES (
+    v_user_id, p_request_id, v_sim_id, v_sim_number, p_network_id, v_tier_id,
+    now(), now() + (v_duration_hours || ' hours')::interval, 'active'
+  ) RETURNING id INTO v_session_id;
+  
+  -- Update request status
+  UPDATE rental_requests 
+  SET status = 'fulfilled', updated_at = now()
+  WHERE id = p_request_id;
+  
+  RETURN v_session_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."auto_assign_rental_sim"("p_request_id" "uuid", "p_network_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."auto_generate_referral_code"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -265,8 +348,7 @@ ALTER FUNCTION "public"."auto_generate_referral_code"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."auto_link_sms_to_otp_session"("p_sim_number" "text") RETURNS "text"
     LANGUAGE "plpgsql"
-    AS $$
-DECLARE
+    AS $$DECLARE
   v_session              record;
   v_candidate            record;
   v_message              record;
@@ -280,7 +362,13 @@ DECLARE
   v_now                  timestamptz := now();
   v_has_any_session      boolean := false;
   v_found_match          boolean := false;
+
+  -- Excluded apps check (jsonb type)
+  v_excluded_apps        jsonb;
 BEGIN
+  -- Use advisory lock to prevent race conditions for same SIM
+  PERFORM pg_advisory_xact_lock(hashtext(p_sim_number));
+
   -- Grab the most recent unlinked message for this SIM.
   SELECT id, sender, message, "timestamp"
   INTO v_message
@@ -288,11 +376,11 @@ BEGIN
   WHERE sim_number = p_sim_number
     AND consumed_by_session IS NULL
   ORDER BY "timestamp" DESC
-  LIMIT 1;
+  LIMIT 1
+  FOR UPDATE;
 
   IF NOT FOUND THEN
-    -- No new message: preserve prior behavior by looking at the most recent active/pending session,
-    -- and performing expiry transitions if needed.
+    -- No new message: check for expiry transitions
     SELECT *
     INTO v_session
     FROM public.otp_sessions
@@ -339,6 +427,13 @@ BEGIN
   v_message_id := v_message.id;
   v_sender := v_message.sender;
 
+  -- Get excluded apps for this SIM (do this once outside the loop for efficiency)
+  -- excluded_apps is jsonb type, default is '[]'::jsonb
+  SELECT excluded_apps INTO v_excluded_apps
+  FROM public.sims
+  WHERE number = p_sim_number
+  LIMIT 1;
+
   -- Find the newest session that is eligible for this message.
   v_session := NULL;
   v_found_match := false;
@@ -349,8 +444,25 @@ BEGIN
     WHERE sim_number = p_sim_number
       AND status IN ('pending', 'active')
     ORDER BY created_at DESC
+    FOR UPDATE
   LOOP
     v_has_any_session := true;
+
+    -- Check if this app is excluded for this SIM
+    -- excluded_apps is jsonb array, use ? operator to check if app_name exists
+    IF v_excluded_apps IS NOT NULL AND jsonb_array_length(v_excluded_apps) > 0 THEN
+      IF v_excluded_apps ? v_candidate.app_name THEN
+        -- App is excluded for this SIM, skip this session
+        CONTINUE;
+      END IF;
+    END IF;
+
+    -- Skip sessions with failed payment (insufficient balance on quick buy)
+    -- Check BOTH payment_status = 'failed' AND status = 'payment_failed'
+    -- Also skip pending sessions - let Node.js handle balance check and linking
+    IF v_candidate.payment_status = 'failed' OR v_candidate.status = 'payment_failed' THEN
+      CONTINUE;
+    END IF;
 
     -- Message must be after the session was created.
     IF v_message."timestamp" < v_candidate.created_at THEN
@@ -377,6 +489,7 @@ BEGIN
     FROM public.sms_messages
     WHERE consumed_by_session = v_candidate.id;
 
+    -- If session already has max messages, mark completed and skip
     IF v_existing_count >= v_max_messages THEN
       IF v_candidate.status != 'completed' THEN
         UPDATE public.otp_sessions
@@ -388,16 +501,14 @@ BEGIN
       CONTINUE;
     END IF;
 
-    -- If only_otp=true, require OTP-looking regex. Otherwise accept any message.
+    -- If only_otp=true, require OTP-looking regex
     IF v_only_otp THEN
       IF v_message.message !~ '(?<!\d)(?!(?:\+?63|0)\d{8,10})(?:\d{4,8}|\d(?:[-\s]?\d){4,7})(?!\d)' THEN
         CONTINUE;
       END IF;
     END IF;
 
-    ---------------------------------------------------------------------
-    -- Sender restriction enforcement (per app)
-    ---------------------------------------------------------------------
+    -- Sender restriction enforcement
     IF v_sender_restrictions IS NOT NULL AND array_length(v_sender_restrictions, 1) > 0 THEN
       IF NOT EXISTS (
         SELECT 1
@@ -407,10 +518,7 @@ BEGIN
         CONTINUE;
       END IF;
     ELSE
-      ---------------------------------------------------------------------
-      -- Fallback safety (existing behavior):
-      -- If sender matches ANY pricing app_name, require it matches this session's app.
-      ---------------------------------------------------------------------
+      -- Fallback: if sender matches ANY pricing app_name, require it matches this session's app
       IF EXISTS (
         SELECT 1
         FROM public.otp_pricing p
@@ -495,14 +603,93 @@ BEGIN
   ELSE
     RETURN 'linked_active';
   END IF;
-END;
-$$;
+END;$$;
 
 
 ALTER FUNCTION "public"."auto_link_sms_to_otp_session"("p_sim_number" "text") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."auto_link_sms_to_otp_session"("p_sim_number" "text") IS 'Automatically links SMS messages to active sessions, supporting per-app only_otp and sender_restrictions';
+COMMENT ON FUNCTION "public"."auto_link_sms_to_otp_session"("p_sim_number" "text") IS 'Links incoming SMS to OTP sessions. Skips sessions with payment_status=pending (quick buy) - Node.js handles balance check and linking for those. Also skips payment_failed sessions.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."auto_link_sms_to_rental_session"("p_sim_number" "text") RETURNS "text"
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+  v_message        record;
+  v_rental_session record;
+  v_now            timestamptz := now();
+BEGIN
+  -- Use advisory lock to prevent race conditions for same SIM
+  PERFORM pg_advisory_xact_lock(hashtext(p_sim_number));
+
+  -- Find active rental session for this SIM number
+  SELECT *
+  INTO v_rental_session
+  FROM public.rental_sessions
+  WHERE number = p_sim_number
+    AND status = 'active'
+    AND expires_at > v_now
+  ORDER BY created_at DESC
+  LIMIT 1
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN 'no_active_rental_session';
+  END IF;
+
+  -- Get the most recent unlinked message for this SIM
+  -- We check sms_messages that haven't been linked to OTP sessions yet
+  -- and that were received after the rental session started
+  SELECT id, sender, message, "timestamp"
+  INTO v_message
+  FROM public.sms_messages
+  WHERE sim_number = p_sim_number
+    AND consumed_by_session IS NULL
+    AND consumed_by_automation_session IS NULL
+    AND "timestamp" >= v_rental_session.created_at
+    AND "timestamp" < COALESCE(v_rental_session.expires_at, v_now + interval '1 day')
+    -- Not already in rental_messages for this session
+    AND NOT EXISTS (
+      SELECT 1 
+      FROM public.rental_messages rm 
+      WHERE rm.session_id = v_rental_session.id 
+        AND rm.message = sms_messages.message 
+        AND rm.received_at = sms_messages."timestamp"
+    )
+  ORDER BY "timestamp" DESC
+  LIMIT 1
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN 'no_new_message';
+  END IF;
+
+  -- Insert into rental_messages
+  INSERT INTO public.rental_messages (session_id, sender, message, raw_message, received_at)
+  VALUES (
+    v_rental_session.id,
+    v_message.sender,
+    v_message.message,
+    v_message.message,
+    v_message."timestamp"
+  );
+
+  -- Update rental session last activity
+  UPDATE public.rental_sessions
+  SET last_activity_at = v_now
+  WHERE id = v_rental_session.id;
+
+  RETURN 'linked_to_rental';
+END;
+$$;
+
+
+ALTER FUNCTION "public"."auto_link_sms_to_rental_session"("p_sim_number" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."auto_link_sms_to_rental_session"("p_sim_number" "text") IS 'Auto-links incoming SMS messages to active rental sessions based on SIM number matching';
 
 
 
@@ -628,6 +815,25 @@ ALTER FUNCTION "public"."backfill_sim_stats_from_usage"() OWNER TO "postgres";
 
 COMMENT ON FUNCTION "public"."backfill_sim_stats_from_usage"() IS 'Backfills sims table with completed counts from sim_app_usage for all SIMs';
 
+
+
+CREATE OR REPLACE FUNCTION "public"."check_auto_assign_rental"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  IF NEW.payment_status = 'paid' AND NEW.status = 'pending' THEN
+    -- Try auto-assign
+    PERFORM auto_assign_rental_sim(NEW.id, NEW.network_id);
+    
+    -- If still pending, no SIM was available (manual approval needed)
+    -- Status remains 'pending' for admin to handle
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."check_auto_assign_rental"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."check_otp_message"("p_session_id" "uuid") RETURNS json
@@ -829,6 +1035,47 @@ $$;
 
 
 ALTER FUNCTION "public"."clear_expires_at_if_pending"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."complete_otp_session"("p_session_id" "uuid", "p_user_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    AS $$
+DECLARE
+  v_session record;
+  v_now timestamptz := now();
+BEGIN
+  SELECT id, status, user_id INTO v_session
+  FROM public.otp_sessions
+  WHERE id = p_session_id;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Session not found');
+  END IF;
+
+  IF v_session.user_id != p_user_id THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'You do not own this session');
+  END IF;
+
+  IF v_session.status = 'completed' THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Session already completed');
+  END IF;
+
+  IF v_session.status NOT IN ('active', 'pending') THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Cannot complete session: ' || v_session.status);
+  END IF;
+
+  UPDATE public.otp_sessions
+  SET status = 'completed',
+      status_updated_at = v_now,
+      last_activity_at = v_now
+  WHERE id = p_session_id;
+
+  RETURN jsonb_build_object('ok', true);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."complete_otp_session"("p_session_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."create_agent_invite_earning_for_tx"("p_agent_transaction_id" bigint) RETURNS "void"
@@ -1043,6 +1290,80 @@ $$;
 
 
 ALTER FUNCTION "public"."create_otp_session"("p_user_id" "uuid", "p_app_name" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."credit_seller_markup_on_session_complete"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_seller_type text;
+  v_markup numeric;
+  v_base numeric;
+  v_paid numeric;
+  v_available_at timestamptz;
+BEGIN
+  IF NEW.status IS DISTINCT FROM 'completed' THEN
+    RETURN NEW;
+  END IF;
+  IF OLD.status IS NOT DISTINCT FROM 'completed' THEN
+    RETURN NEW;
+  END IF;
+  IF NEW.seller_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT type INTO v_seller_type FROM public.sellers WHERE id = NEW.seller_id;
+  IF v_seller_type IS DISTINCT FROM 'standard' THEN
+    RETURN NEW;
+  END IF;
+
+  v_paid := COALESCE(NEW.price_paid, 0);
+  v_base := COALESCE(NEW.site_base_price, 0);
+  v_markup := COALESCE(NEW.reseller_markup_amount, GREATEST(v_paid - v_base, 0));
+
+  IF v_markup <= 0 THEN
+    RETURN NEW;
+  END IF;
+
+  v_available_at := now() + interval '24 hours';
+
+  INSERT INTO public.seller_ledger_entries (
+    seller_id,
+    otp_session_id,
+    entry_type,
+    amount,
+    platform_base_amount,
+    customer_paid_amount,
+    description,
+    status,
+    available_at
+  ) VALUES (
+    NEW.seller_id,
+    NEW.id,
+    'markup_earning',
+    v_markup,
+    v_base,
+    v_paid,
+    'Markup for ' || COALESCE(NEW.app_name, 'otp'),
+    'pending',
+    v_available_at
+  )
+  ON CONFLICT (otp_session_id, entry_type) DO NOTHING;
+
+  INSERT INTO public.seller_wallets (seller_id, available_balance, lifetime_earned, pending_balance)
+  VALUES (NEW.seller_id, 0, v_markup, v_markup)
+  ON CONFLICT (seller_id) DO UPDATE SET
+    pending_balance = seller_wallets.pending_balance + EXCLUDED.pending_balance,
+    lifetime_earned = seller_wallets.lifetime_earned + EXCLUDED.lifetime_earned,
+    updated_at = now();
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."credit_seller_markup_on_session_complete"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."delete_expired_otps"() RETURNS "void"
@@ -1403,6 +1724,20 @@ $$;
 
 
 ALTER FUNCTION "public"."expire_otp_sessions"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."expire_rental_sessions"() RETURNS "void"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  UPDATE rental_sessions
+  SET status = 'expired', updated_at = now()
+  WHERE status = 'active' AND expires_at < now();
+END;
+$$;
+
+
+ALTER FUNCTION "public"."expire_rental_sessions"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."fn_accumulate_device_uptime"() RETURNS "trigger"
@@ -1895,6 +2230,20 @@ $$;
 ALTER FUNCTION "public"."handle_manual_payment_status"("p_payment_id" "uuid", "p_status" "text", "p_approved_by" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."increment_message_count"("session_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  UPDATE otp_sessions 
+  SET message_count = COALESCE(message_count, 0) + 1 
+  WHERE id = session_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."increment_message_count"("session_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."increment_sim_failed"("p_sim_id" bigint) RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
@@ -2197,10 +2546,26 @@ DECLARE
     max_time timestamptz;
     candidate record;
     v_user_balance DECIMAL(10,2);
+    v_fee_percentage DECIMAL(5,4) := 0.0000;
 BEGIN
     -- Only process if status is 'pending'
     IF NEW.status IS DISTINCT FROM 'pending' THEN
         RETURN NEW;
+    END IF;
+    
+    -- Ensure fee is calculated (in case trg_apply_topup_fee hasn't run yet)
+    -- This is a safety measure - the trigger should have already set these
+    IF NEW.net_amount IS NULL THEN
+        -- Get fee_percentage from payment_methods
+        SELECT COALESCE(pm.fee_percentage, 0.0000) INTO v_fee_percentage
+        FROM public.payment_methods pm
+        WHERE pm.id::text = NEW.payment_method_id
+           OR lower(pm.name) = lower(NEW.payment_method_id)
+        LIMIT 1;
+
+        -- Fee is added on top, user receives full amount
+        NEW.fee_amount := NEW.amount * v_fee_percentage;
+        NEW.net_amount := NEW.amount; -- User receives full amount
     END IF;
     
     min_time := NEW.created_at - make_interval(mins => window_minutes);
@@ -2230,12 +2595,12 @@ BEGIN
     FROM public.users
     WHERE id = NEW.user_id;
     
-    -- Update wallet balance
+    -- Update wallet balance with NET amount (after fee)
     UPDATE public.users
-    SET wallet_balance = COALESCE(v_user_balance, 0) + NEW.amount
+    SET wallet_balance = COALESCE(v_user_balance, 0) + COALESCE(NEW.net_amount, NEW.amount)
     WHERE id = NEW.user_id;
     
-    -- Create wallet transaction
+    -- Create wallet transaction with NET amount
     INSERT INTO public.wallet_transactions (
         user_id,
         type,
@@ -2247,11 +2612,14 @@ BEGIN
     ) VALUES (
         NEW.user_id,
         'topup',
-        NEW.amount,
-        'Wallet top-up (auto-approved via GCash notification)',
+        COALESCE(NEW.net_amount, NEW.amount),
+        CASE 
+            WHEN NEW.fee_amount > 0 THEN 'Wallet top-up (auto-approved via GCash notification, fee: ₱' || NEW.fee_amount || ')'
+            ELSE 'Wallet top-up (auto-approved via GCash notification)'
+        END,
         'success',
         COALESCE(v_user_balance, 0),
-        COALESCE(v_user_balance, 0) + NEW.amount
+        COALESCE(v_user_balance, 0) + COALESCE(NEW.net_amount, NEW.amount)
     );
     
     -- Mark top-up as approved (but don't update gcash_notif yet - that happens in AFTER trigger)
@@ -2259,8 +2627,8 @@ BEGIN
     NEW.approved_at := NOW();
     NEW.matched_notification_id := candidate.id;
     
-    -- Store the candidate.id in a temporary variable for the AFTER trigger
-    -- We'll use a custom attribute or just rely on matched_notification_id
+    -- Note: gcash_notif is updated in the AFTER trigger (update_gcash_notif_after_topup_match)
+    -- to avoid foreign key constraint violation
     
     RETURN NEW;
 END;
@@ -2603,6 +2971,43 @@ COMMENT ON FUNCTION "public"."process_agent_earnings_on_otp_complete"() IS 'Auto
 
 
 
+CREATE OR REPLACE FUNCTION "public"."process_pending_sms_for_rentals"() RETURNS integer
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+  v_count      integer := 0;
+  v_sim_number text;
+  v_result     text;
+BEGIN
+  -- Get distinct SIM numbers with unlinked messages that have active rentals
+  FOR v_sim_number IN
+    SELECT DISTINCT s.sim_number
+    FROM public.sms_messages s
+    INNER JOIN public.rental_sessions r ON r.number = s.sim_number
+    WHERE s.consumed_by_session IS NULL
+      AND s.consumed_by_automation_session IS NULL
+      AND r.status = 'active'
+      AND r.expires_at > now()
+      AND s."timestamp" >= r.created_at
+  LOOP
+    v_result := public.auto_link_sms_to_rental_session(v_sim_number);
+    IF v_result = 'linked_to_rental' THEN
+      v_count := v_count + 1;
+    END IF;
+  END LOOP;
+  
+  RETURN v_count;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."process_pending_sms_for_rentals"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."process_pending_sms_for_rentals"() IS 'Manually process pending SMS messages for all active rental sessions';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."process_referral_commission"("p_otp_session_id" "uuid", "p_user_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
@@ -2716,26 +3121,41 @@ COMMENT ON FUNCTION "public"."process_referral_commission"("p_otp_session_id" "u
 CREATE OR REPLACE FUNCTION "public"."rebuild_sim_stats_total_earnings"() RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
-begin
-  update public.sim_stats ss
-  set total_earnings = coalesce(t.total, 0),
+BEGIN
+  UPDATE public.sim_stats ss
+  SET total_earnings = coalesce(pst.total, 0),
       updated_at = now()
-  from (
-    select s.id as sim_id,
-           coalesce(sum(at.agent_share), 0) as total
-    from public.sims s
-    left join public.agent_transactions at
-      on at.sim_number = s.number
-      or at.sim_number = case when left(s.number, 1) = '+' then substring(s.number from 2) else '+' || s.number end
-      or at.sim_number = case when left(s.number, 1) = '+' then s.number else '+' || s.number end
-    group by s.id
-  ) t
-  where ss.sim_id = t.sim_id;
-end;
+  FROM (
+    SELECT s.id AS sim_id,
+           coalesce(sum(a.amt), 0) AS total
+    FROM public.sims s
+    CROSS JOIN LATERAL (
+      SELECT DISTINCT u AS norm
+      FROM unnest(
+        ARRAY[
+          s.number,
+          CASE WHEN left(s.number, 1) = '+' THEN substring(s.number FROM 2) ELSE '+' || s.number END,
+          CASE WHEN left(s.number, 1) = '+' THEN s.number ELSE '+' || s.number END
+        ]
+      ) AS u
+    ) nums
+    LEFT JOIN (
+      SELECT sim_number, sum(agent_share) AS amt
+      FROM public.agent_transactions
+      GROUP BY sim_number
+    ) a ON a.sim_number = nums.norm
+    GROUP BY s.id
+  ) pst
+  WHERE ss.sim_id = pst.sim_id;
+END;
 $$;
 
 
 ALTER FUNCTION "public"."rebuild_sim_stats_total_earnings"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."rebuild_sim_stats_total_earnings"() IS 'Recomputes sim_stats.total_earnings for all SIMs. Prefer refresh_sim_stats_total_earnings_for_sim for hot paths.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."recalculate_agent_balance_from_transactions"("p_user_id" "uuid") RETURNS TABLE("pending_balance" numeric, "available_balance" numeric, "lifetime_claimed" numeric)
@@ -3057,6 +3477,43 @@ $$;
 ALTER FUNCTION "public"."record_sim_heartbeat"("p_sim_number" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."refresh_sim_stats_total_earnings_for_sim"("p_sim_id" bigint) RETURNS "void"
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+  v_number text;
+  v_total numeric(18, 2);
+BEGIN
+  SELECT s.number INTO v_number FROM public.sims s WHERE s.id = p_sim_id;
+  IF v_number IS NULL OR v_number = '' THEN
+    RETURN;
+  END IF;
+
+  SELECT coalesce(sum(at.agent_share), 0)::numeric(18, 2)
+  INTO v_total
+  FROM public.agent_transactions at
+  WHERE at.sim_number IN (
+    v_number,
+    CASE WHEN left(v_number, 1) = '+' THEN substring(v_number FROM 2) ELSE '+' || v_number END,
+    CASE WHEN left(v_number, 1) = '+' THEN v_number ELSE '+' || v_number END
+  );
+
+  INSERT INTO public.sim_stats (sim_id, total_earnings, updated_at)
+  VALUES (p_sim_id, coalesce(v_total, 0), now())
+  ON CONFLICT (sim_id) DO UPDATE
+  SET total_earnings = EXCLUDED.total_earnings,
+      updated_at = EXCLUDED.updated_at;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."refresh_sim_stats_total_earnings_for_sim"("p_sim_id" bigint) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."refresh_sim_stats_total_earnings_for_sim"("p_sim_id" bigint) IS 'Recomputes sim_stats.total_earnings for one SIM from agent_transactions (indexed IN list).';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."reset_sim_failure_streak_on_success_usage"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -3096,6 +3553,25 @@ $$;
 
 
 ALTER FUNCTION "public"."reset_sim_failure_streak_on_success_usage"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."resolve_sim_id_from_agent_sim_number"("p_sim_number" "text") RETURNS bigint
+    LANGUAGE "sql" STABLE
+    AS $$
+  SELECT s.id
+  FROM public.sims s
+  WHERE p_sim_number IS NOT NULL
+    AND p_sim_number <> ''
+    AND (
+      s.number = p_sim_number
+      OR s.number = CASE WHEN left(p_sim_number, 1) = '+' THEN substring(p_sim_number FROM 2) ELSE '+' || p_sim_number END
+      OR s.number = CASE WHEN left(p_sim_number, 1) = '+' THEN p_sim_number ELSE '+' || p_sim_number END
+    )
+  LIMIT 1;
+$$;
+
+
+ALTER FUNCTION "public"."resolve_sim_id_from_agent_sim_number"("p_sim_number" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."set_default_referrer_for_users"() RETURNS "jsonb"
@@ -3571,14 +4047,41 @@ ALTER FUNCTION "public"."transition_otp_session_status"("session_id" "uuid", "ne
 CREATE OR REPLACE FUNCTION "public"."trg_call_rebuild_sim_stats_total_earnings"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
+DECLARE
+  v_old_id bigint;
+  v_new_id bigint;
 BEGIN
-  PERFORM public.rebuild_sim_stats_total_earnings();
-    RETURN NEW;
-    END;
-    $$;
+  IF TG_OP = 'DELETE' THEN
+    v_old_id := public.resolve_sim_id_from_agent_sim_number(OLD.sim_number);
+    IF v_old_id IS NOT NULL THEN
+      PERFORM public.refresh_sim_stats_total_earnings_for_sim(v_old_id);
+    END IF;
+    RETURN OLD;
+  END IF;
+
+  v_new_id := public.resolve_sim_id_from_agent_sim_number(NEW.sim_number);
+  IF v_new_id IS NOT NULL THEN
+    PERFORM public.refresh_sim_stats_total_earnings_for_sim(v_new_id);
+  END IF;
+
+  IF TG_OP = 'UPDATE'
+     AND OLD.sim_number IS DISTINCT FROM NEW.sim_number THEN
+    v_old_id := public.resolve_sim_id_from_agent_sim_number(OLD.sim_number);
+    IF v_old_id IS NOT NULL AND v_old_id IS DISTINCT FROM v_new_id THEN
+      PERFORM public.refresh_sim_stats_total_earnings_for_sim(v_old_id);
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
 
 
 ALTER FUNCTION "public"."trg_call_rebuild_sim_stats_total_earnings"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."trg_call_rebuild_sim_stats_total_earnings"() IS 'After agent_transactions change, refresh sim_stats.total_earnings for the affected SIM only.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."trg_manual_payments_apply_payment_method_balance"() RETURNS "trigger"
@@ -3767,6 +4270,30 @@ $$;
 
 
 ALTER FUNCTION "public"."trigger_auto_link_sms_automation"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."trigger_auto_link_sms_rental"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+  v_result text;
+BEGIN
+  -- Try to link to rental session
+  v_result := public.auto_link_sms_to_rental_session(NEW.sim_number);
+  
+  -- Log for debugging (optional)
+  RAISE LOG 'Rental SMS link result for %: %', NEW.sim_number, v_result;
+  
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."trigger_auto_link_sms_rental"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."trigger_auto_link_sms_rental"() IS 'Trigger function that automatically links SMS to rental sessions on insert';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."trigger_process_referral_on_otp_complete"() RETURNS "trigger"
@@ -4035,6 +4562,19 @@ $$;
 
 
 ALTER FUNCTION "public"."update_device_and_sim_status"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."update_device_is_online"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+    NEW.is_online := NEW.last_seen > NOW() - INTERVAL '30 minutes';
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_device_is_online"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_device_name_in_sims"() RETURNS "trigger"
@@ -4819,7 +5359,8 @@ CREATE TABLE IF NOT EXISTS "public"."api_keys" (
     "scopes" "jsonb",
     "revoked_at" timestamp with time zone,
     "last_used_at" timestamp with time zone,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "seller_id" "uuid"
 );
 
 
@@ -4988,11 +5529,30 @@ CREATE TABLE IF NOT EXISTS "public"."devices" (
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "user_id" "uuid",
     "uptime_seconds" bigint DEFAULT 0 NOT NULL,
-    "last_status_change" timestamp with time zone
+    "last_status_change" timestamp with time zone,
+    "battery_level" integer,
+    "battery_charging" boolean DEFAULT false,
+    "signal_strength" integer,
+    "network_type" character varying(10) DEFAULT NULL::character varying,
+    "last_heartbeat_at" timestamp with time zone DEFAULT "now"(),
+    "is_online" boolean DEFAULT false,
+    "seller_id" "uuid"
 );
 
 
 ALTER TABLE "public"."devices" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."devices"."battery_level" IS 'Device battery level (0-100), updated on heartbeat';
+
+
+
+COMMENT ON COLUMN "public"."devices"."battery_charging" IS 'Whether device is currently charging';
+
+
+
+COMMENT ON COLUMN "public"."devices"."last_heartbeat_at" IS 'Timestamp of last successful heartbeat';
+
 
 
 CREATE OR REPLACE VIEW "public"."device_status" AS
@@ -5166,6 +5726,7 @@ END) STORED,
     "otp_session_id" "uuid",
     "agent_user_id" "uuid",
     "agent_direct" boolean DEFAULT false NOT NULL,
+    "seller_id" "uuid",
     CONSTRAINT "manual_payments_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text"])))
 );
 
@@ -5321,7 +5882,11 @@ END) STORED,
     "parent_session_id" "uuid",
     "change_number_count" integer DEFAULT 0 NOT NULL,
     "last_change_number_at" timestamp with time zone,
-    CONSTRAINT "otp_sessions_extended_count_max_2" CHECK ((("extended_count" >= 0) AND ("extended_count" <= 2)))
+    "payment_status" character varying(20) DEFAULT 'paid'::character varying,
+    "seller_id" "uuid",
+    "inventory_source" "text",
+    "reseller_markup_amount" numeric,
+    CONSTRAINT "otp_sessions_inventory_source_check" CHECK ((("inventory_source" IS NULL) OR ("inventory_source" = ANY (ARRAY['platform_pool'::"text", 'seller_private'::"text", 'marketplace_supplier'::"text"]))))
 );
 
 
@@ -5400,7 +5965,7 @@ COMMENT ON COLUMN "public"."otp_sessions"."agent_price" IS 'Final price charged 
 
 
 
-COMMENT ON COLUMN "public"."otp_sessions"."site_base_price" IS 'Snapshot of site base price for this app at the time of session creation.';
+COMMENT ON COLUMN "public"."otp_sessions"."site_base_price" IS 'Platform base price per session at purchase (otp_pricing.price).';
 
 
 
@@ -5417,6 +5982,22 @@ COMMENT ON COLUMN "public"."otp_sessions"."price_paid" IS 'Snapshot of the price
 
 
 COMMENT ON COLUMN "public"."otp_sessions"."paid_with_voucher" IS 'True when this session was paid using a voucher. Refunds are not allowed for voucher-paid sessions.';
+
+
+
+COMMENT ON COLUMN "public"."otp_sessions"."extended_count" IS 'Total number of extensions (first 2 are free, after that P1 per 5 min)';
+
+
+
+COMMENT ON COLUMN "public"."otp_sessions"."payment_status" IS 'Payment status: paid (default), pending (quick buy - awaiting SMS), failed (insufficient balance on SMS arrival)';
+
+
+
+COMMENT ON COLUMN "public"."otp_sessions"."inventory_source" IS 'platform_pool = main OTPOCKET pool; seller_private = agent/supplier-owned SIM; marketplace_supplier = Phase 4.';
+
+
+
+COMMENT ON COLUMN "public"."otp_sessions"."reseller_markup_amount" IS 'Markup retained by standard seller (customer price - base).';
 
 
 
@@ -5456,6 +6037,7 @@ CREATE TABLE IF NOT EXISTS "public"."otp_pricing" (
     "only_otp" boolean DEFAULT true NOT NULL,
     "sender_restrictions" "text"[],
     "hidden" boolean DEFAULT false NOT NULL,
+    "available_sims" integer DEFAULT 0,
     CONSTRAINT "otp_pricing_discount_percentage_check" CHECK ((("discount_percentage" IS NULL) OR (("discount_percentage" >= (0)::numeric) AND ("discount_percentage" <= (100)::numeric))))
 );
 
@@ -5561,11 +6143,16 @@ CREATE TABLE IF NOT EXISTS "public"."payment_methods" (
     "icon_url" "text",
     "account_name" "text",
     "wallet_balance" numeric(10,2) DEFAULT 0.00 NOT NULL,
-    "note" "text"
+    "note" "text",
+    "fee_percentage" numeric(5,4) DEFAULT 0.0000
 );
 
 
 ALTER TABLE "public"."payment_methods" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."payment_methods"."fee_percentage" IS 'Fee percentage for wallet topups (e.g., 0.0100 = 1%). Applied to topup amount.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."proof_cases" (
@@ -5745,6 +6332,113 @@ COMMENT ON CONSTRAINT "referral_milestones_claimed_check" ON "public"."referral_
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."rental_extensions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "session_id" "uuid" NOT NULL,
+    "tier_id" "uuid" NOT NULL,
+    "hours_added" integer NOT NULL,
+    "amount_paid" numeric(10,2) NOT NULL,
+    "payment_status" character varying(20) DEFAULT 'pending'::character varying,
+    "payment_method" character varying(20),
+    "voucher_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."rental_extensions" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."rental_messages" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "session_id" "uuid" NOT NULL,
+    "sender" character varying(50),
+    "message" "text",
+    "raw_message" "text",
+    "received_at" timestamp with time zone DEFAULT "now"(),
+    "created_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."rental_messages" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."rental_networks" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "name" character varying(50) NOT NULL,
+    "description" "text",
+    "is_active" boolean DEFAULT true,
+    "price_multiplier" numeric(3,2) DEFAULT 1.00,
+    "sort_order" integer DEFAULT 0,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."rental_networks" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."rental_requests" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "tier_id" "uuid" NOT NULL,
+    "network_id" "uuid",
+    "notes" "text",
+    "status" character varying(20) DEFAULT 'pending'::character varying,
+    "payment_status" character varying(20) DEFAULT 'pending'::character varying,
+    "payment_method" character varying(20),
+    "amount_paid" numeric(10,2) DEFAULT 0,
+    "voucher_id" "uuid",
+    "rejected_reason" "text",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "approved_at" timestamp with time zone,
+    "approved_by" "uuid"
+);
+
+
+ALTER TABLE "public"."rental_requests" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."rental_sessions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "request_id" "uuid",
+    "sim_id" bigint,
+    "number" character varying(20) NOT NULL,
+    "network_id" "uuid",
+    "tier_id" "uuid" NOT NULL,
+    "started_at" timestamp with time zone DEFAULT "now"(),
+    "expires_at" timestamp with time zone NOT NULL,
+    "status" character varying(20) DEFAULT 'active'::character varying,
+    "extended_count" integer DEFAULT 0,
+    "extension_tier_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "last_activity_at" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."rental_sessions" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."rental_tiers" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "name" character varying(50) NOT NULL,
+    "description" "text",
+    "duration_hours" integer NOT NULL,
+    "price" numeric(10,2) NOT NULL,
+    "is_popular" boolean DEFAULT false,
+    "is_active" boolean DEFAULT true,
+    "sort_order" integer DEFAULT 0,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."rental_tiers" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."review_replies" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "review_id" "uuid" NOT NULL,
@@ -5809,6 +6503,231 @@ CREATE TABLE IF NOT EXISTS "public"."scheduler_leases" (
 ALTER TABLE "public"."scheduler_leases" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."seller_applications" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid",
+    "email" "text" NOT NULL,
+    "business_name" "text" NOT NULL,
+    "desired_slug" "text" NOT NULL,
+    "message" "text",
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "admin_notes" "text",
+    "reviewed_at" timestamp with time zone,
+    "reviewed_by" "uuid",
+    "created_seller_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "seller_applications_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text", 'contacted'::"text"])))
+);
+
+
+ALTER TABLE "public"."seller_applications" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."seller_branding" (
+    "seller_id" "uuid" NOT NULL,
+    "logo_url" "text",
+    "primary_color" "text" DEFAULT '#2563eb'::"text",
+    "accent_color" "text" DEFAULT '#0ea5e9'::"text",
+    "display_name" "text",
+    "tagline" "text",
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."seller_branding" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."seller_ledger_entries" (
+    "id" bigint NOT NULL,
+    "seller_id" "uuid" NOT NULL,
+    "otp_session_id" "uuid",
+    "entry_type" "text" NOT NULL,
+    "amount" numeric NOT NULL,
+    "platform_base_amount" numeric,
+    "customer_paid_amount" numeric,
+    "description" "text",
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "available_at" timestamp with time zone,
+    CONSTRAINT "seller_ledger_entries_entry_type_check" CHECK (("entry_type" = ANY (ARRAY['markup_earning'::"text", 'adjustment'::"text", 'payout'::"text", 'refund_reversal'::"text"]))),
+    CONSTRAINT "seller_ledger_entries_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'available'::"text", 'cancelled'::"text"])))
+);
+
+
+ALTER TABLE "public"."seller_ledger_entries" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."seller_ledger_entries" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME "public"."seller_ledger_entries_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."seller_service_offers" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "seller_id" "uuid" NOT NULL,
+    "app_name" "text" NOT NULL,
+    "markup_type" "text" DEFAULT 'fixed'::"text" NOT NULL,
+    "markup_value" numeric DEFAULT 0 NOT NULL,
+    "is_active" boolean DEFAULT true NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "seller_service_offers_markup_type_check" CHECK (("markup_type" = ANY (ARRAY['fixed'::"text", 'percent'::"text"]))),
+    CONSTRAINT "seller_service_offers_markup_value_check" CHECK (("markup_value" >= (0)::numeric))
+);
+
+
+ALTER TABLE "public"."seller_service_offers" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."seller_storefronts" (
+    "seller_id" "uuid" NOT NULL,
+    "slug" "text" NOT NULL,
+    "is_published" boolean DEFAULT true NOT NULL,
+    "welcome_message" "text",
+    "support_email" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."seller_storefronts" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."seller_telegram_bots" (
+    "seller_id" "uuid" NOT NULL,
+    "bot_token" "text" NOT NULL,
+    "bot_username" "text",
+    "bot_id" bigint,
+    "is_active" boolean DEFAULT true NOT NULL,
+    "last_verified_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "webhook_secret" "text",
+    "webhook_set_at" timestamp with time zone,
+    "telegram_support_url" "text",
+    "telegram_announcement_url" "text",
+    "telegram_group_url" "text",
+    "show_telegram_support" boolean DEFAULT true NOT NULL,
+    "show_telegram_announcement" boolean DEFAULT true NOT NULL,
+    "show_telegram_group" boolean DEFAULT true NOT NULL
+);
+
+
+ALTER TABLE "public"."seller_telegram_bots" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."seller_telegram_bots" IS 'Per-reseller Telegram bot token (from @BotFather). Webhook routing Phase 3.';
+
+
+
+COMMENT ON COLUMN "public"."seller_telegram_bots"."webhook_secret" IS 'Passed to Telegram setWebhook as secret_token; validated on incoming updates.';
+
+
+
+COMMENT ON COLUMN "public"."seller_telegram_bots"."webhook_set_at" IS 'When setWebhook last succeeded for this reseller bot.';
+
+
+
+COMMENT ON COLUMN "public"."seller_telegram_bots"."telegram_support_url" IS 'URL shown on Support button in reseller dedicated bot (e.g. t.me/username).';
+
+
+
+COMMENT ON COLUMN "public"."seller_telegram_bots"."telegram_announcement_url" IS 'URL for announcements channel in reseller bot.';
+
+
+
+COMMENT ON COLUMN "public"."seller_telegram_bots"."telegram_group_url" IS 'URL for support/community group in reseller bot.';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."seller_users" (
+    "seller_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "role" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "seller_users_role_check" CHECK (("role" = ANY (ARRAY['owner'::"text", 'admin'::"text", 'staff'::"text"])))
+);
+
+
+ALTER TABLE "public"."seller_users" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."seller_wallets" (
+    "seller_id" "uuid" NOT NULL,
+    "pending_balance" numeric DEFAULT 0 NOT NULL,
+    "available_balance" numeric DEFAULT 0 NOT NULL,
+    "lifetime_earned" numeric DEFAULT 0 NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."seller_wallets" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."seller_withdrawal_requests" (
+    "id" bigint NOT NULL,
+    "seller_id" "uuid" NOT NULL,
+    "amount" numeric NOT NULL,
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "withdrawal_payment_method_id" "uuid",
+    "withdrawal_account_name" "text",
+    "withdrawal_account_number" "text",
+    "description" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "reviewed_at" timestamp with time zone,
+    "reviewed_by" "uuid",
+    CONSTRAINT "seller_withdrawal_requests_amount_check" CHECK (("amount" >= (10)::numeric)),
+    CONSTRAINT "seller_withdrawal_requests_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text", 'cancelled'::"text"])))
+);
+
+
+ALTER TABLE "public"."seller_withdrawal_requests" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."seller_withdrawal_requests" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME "public"."seller_withdrawal_requests_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."sellers" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "slug" "text" NOT NULL,
+    "name" "text" NOT NULL,
+    "type" "text" NOT NULL,
+    "status" "text" DEFAULT 'active'::"text" NOT NULL,
+    "owner_user_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "customer_withdrawal_enabled" boolean DEFAULT true NOT NULL,
+    CONSTRAINT "sellers_status_check" CHECK (("status" = ANY (ARRAY['active'::"text", 'suspended'::"text", 'pending'::"text"]))),
+    CONSTRAINT "sellers_type_check" CHECK (("type" = ANY (ARRAY['platform'::"text", 'standard'::"text", 'supplier'::"text", 'hybrid'::"text"])))
+);
+
+
+ALTER TABLE "public"."sellers" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."sellers" IS 'Tenant root: platform, reseller (standard), supplier (agent inventory), hybrid.';
+
+
+
+COMMENT ON COLUMN "public"."sellers"."customer_withdrawal_enabled" IS 'When false, customers on this reseller Telegram bot see wallet top-up only (no withdraw).';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."sim_app_usage" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "sim_number" "text" NOT NULL,
@@ -5821,7 +6740,8 @@ CREATE TABLE IF NOT EXISTS "public"."sim_app_usage" (
     "gross_amount" numeric(12,2),
     "agent_share" numeric(12,2),
     "site_share" numeric(12,2),
-    "agent_direct" boolean DEFAULT false NOT NULL
+    "agent_direct" boolean DEFAULT false NOT NULL,
+    "seller_id" "uuid"
 );
 
 
@@ -5876,11 +6796,25 @@ CASE
 END) STORED,
     "paused_at" timestamp with time zone,
     "paused_reason" "text",
-    "paused_context" "jsonb"
+    "paused_context" "jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "last_transaction_at" timestamp with time zone,
+    "is_protected" boolean DEFAULT false,
+    "signal_strength" integer,
+    "network_type" character varying(10) DEFAULT NULL::character varying,
+    "locked_until" timestamp with time zone,
+    "violation_count" integer DEFAULT 0,
+    "is_paused" boolean DEFAULT false,
+    "paused_until" timestamp with time zone,
+    "seller_id" "uuid"
 );
 
 
 ALTER TABLE "public"."sims" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."sims"."type" IS 'SIM types: private (OTP), public (free), rental/dedicated (for number rental)';
+
 
 
 COMMENT ON COLUMN "public"."sims"."status" IS 'SIM status: DISABLED, CONFIGURING, ACTIVE, IN_USE, OFFLINE, PAUSED';
@@ -5908,6 +6842,26 @@ COMMENT ON COLUMN "public"."sims"."total_failed" IS 'Total number of failed sess
 
 
 COMMENT ON COLUMN "public"."sims"."success_rate" IS 'Reliability score from 0..1 computed from total_completed / (total_completed + total_failed).';
+
+
+
+COMMENT ON COLUMN "public"."sims"."created_at" IS 'Timestamp when this SIM was first registered in the system';
+
+
+
+COMMENT ON COLUMN "public"."sims"."last_transaction_at" IS 'Timestamp of last OTP transaction on this SIM';
+
+
+
+COMMENT ON COLUMN "public"."sims"."is_protected" IS 'True when SIM has active session - should not be removed';
+
+
+
+COMMENT ON COLUMN "public"."sims"."signal_strength" IS 'Signal strength for this SIM slot (ASU 0-31, -1 = unknown)';
+
+
+
+COMMENT ON COLUMN "public"."sims"."network_type" IS 'Network type for this SIM: 2G, 3G, 4G, 5G, UNKNOWN';
 
 
 
@@ -5995,7 +6949,8 @@ ALTER TABLE "public"."sim_failure_streaks" OWNER TO "postgres";
 CREATE TABLE IF NOT EXISTS "public"."sim_group_members" (
     "group_id" "uuid" NOT NULL,
     "sim_number" "text" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "sim_number_not_empty" CHECK (("length"(TRIM(BOTH FROM "sim_number")) > 0))
 );
 
 
@@ -6052,6 +7007,40 @@ CREATE OR REPLACE VIEW "public"."sim_last_used_app_by_sim" AS
 
 
 ALTER VIEW "public"."sim_last_used_app_by_sim" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."sim_removal_violations" (
+    "id" integer NOT NULL,
+    "user_id" "uuid",
+    "sim_id" integer,
+    "device_id" character varying(255),
+    "violation_type" character varying(50),
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "pause_until" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."sim_removal_violations" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."sim_removal_violations" IS 'Tracks violations when SIMs are removed during active sessions';
+
+
+
+CREATE SEQUENCE IF NOT EXISTS "public"."sim_removal_violations_id_seq"
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE "public"."sim_removal_violations_id_seq" OWNER TO "postgres";
+
+
+ALTER SEQUENCE "public"."sim_removal_violations_id_seq" OWNED BY "public"."sim_removal_violations"."id";
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."sim_stats" (
@@ -6175,6 +7164,17 @@ CREATE TABLE IF NOT EXISTS "public"."telegram_referral_invite_events" (
 ALTER TABLE "public"."telegram_referral_invite_events" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."telegram_rental_warning_events" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "session_id" "uuid" NOT NULL,
+    "threshold_seconds" integer NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."telegram_rental_warning_events" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."telegram_session_warning_events" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "provider" "text" DEFAULT 'telegram'::"text" NOT NULL,
@@ -6245,11 +7245,16 @@ CREATE TABLE IF NOT EXISTS "public"."user_chat_links" (
     "chat_id" "text" NOT NULL,
     "username" "text",
     "linked_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "revoked_at" timestamp with time zone
+    "revoked_at" timestamp with time zone,
+    "seller_id" "uuid"
 );
 
 
 ALTER TABLE "public"."user_chat_links" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."user_chat_links"."seller_id" IS 'Set when user links via a reseller dedicated Telegram bot; used for notification routing fallback.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."users" (
@@ -6279,7 +7284,8 @@ CREATE TABLE IF NOT EXISTS "public"."users" (
     "signup_source" "text" DEFAULT 'web'::"text",
     "accepted_agent_quality_rules_at" timestamp with time zone,
     "accepted_agent_quality_rules_version" "text",
-    CONSTRAINT "users_role_check" CHECK (("role" = ANY (ARRAY['admin'::"text", 'user'::"text"])))
+    "registered_seller_id" "uuid",
+    CONSTRAINT "users_role_check" CHECK (("role" = ANY (ARRAY['admin'::"text", 'user'::"text", 'support'::"text"])))
 );
 
 
@@ -6303,6 +7309,10 @@ COMMENT ON COLUMN "public"."users"."used_sim_numbers" IS 'Array of all SIM numbe
 
 
 COMMENT ON COLUMN "public"."users"."priority" IS 'SIM assignment override: higher number = higher priority user.';
+
+
+
+COMMENT ON COLUMN "public"."users"."registered_seller_id" IS 'Set when the user creates an account via a reseller dedicated Telegram bot.';
 
 
 
@@ -6532,6 +7542,65 @@ ALTER VIEW "public"."v_batch_unlock_progress" OWNER TO "postgres";
 
 
 COMMENT ON VIEW "public"."v_batch_unlock_progress" IS 'View showing current progress towards next batch unlock based on agent earnings';
+
+
+
+CREATE OR REPLACE VIEW "public"."v_batch_unlock_sim_contributions" AS
+ WITH "config" AS (
+         SELECT "batch_unlock_config"."target_per_sim",
+            "batch_unlock_config"."included_agent_ids",
+            "batch_unlock_config"."included_agent_emails",
+            "batch_unlock_config"."is_active",
+                CASE
+                    WHEN (("cardinality"("batch_unlock_config"."included_agent_ids") = 0) AND ("cardinality"("batch_unlock_config"."included_agent_emails") = 0)) THEN true
+                    ELSE false
+                END AS "use_all_agents"
+           FROM "public"."batch_unlock_config"
+          WHERE ("batch_unlock_config"."id" = 1)
+        ), "configured_agent_ids" AS (
+         SELECT DISTINCT "u_1"."id"
+           FROM ("config" "c_1"
+             CROSS JOIN "public"."users" "u_1")
+          WHERE (("u_1"."id" = ANY ("c_1"."included_agent_ids")) OR ("u_1"."email" = ANY ("c_1"."included_agent_emails")))
+        )
+ SELECT "s"."id" AS "sim_id",
+    "s"."number" AS "sim_number",
+    "v"."device_id",
+    "d"."user_id" AS "agent_id",
+    "u"."email" AS "agent_email",
+    "v"."type" AS "sim_type",
+    "v"."computed_status" AS "sim_status",
+    "ss"."total_earnings",
+    "ss"."total_completed",
+    "ss"."total_failed",
+    "ss"."uptime_seconds",
+    "d"."name" AS "device_label",
+    "d"."last_seen" AS "device_last_seen",
+    "s"."slot" AS "slot_index",
+        CASE
+            WHEN ("c"."target_per_sim" > (0)::numeric) THEN "round"((("ss"."total_earnings" / "c"."target_per_sim") * (100)::numeric), 2)
+            ELSE (0)::numeric
+        END AS "contribution_percentage",
+        CASE
+            WHEN ("ss"."total_earnings" >= "c"."target_per_sim") THEN true
+            ELSE false
+        END AS "has_hit_target",
+    GREATEST((0)::numeric, ("c"."target_per_sim" - "ss"."total_earnings")) AS "remaining_to_target",
+    "c"."target_per_sim"
+   FROM ((((("public"."v_sims_with_status" "v"
+     JOIN "public"."sims" "s" ON (("s"."number" = "v"."number")))
+     JOIN "public"."sim_stats" "ss" ON (("ss"."sim_id" = "s"."id")))
+     JOIN "public"."devices" "d" ON (("d"."device_id" = "v"."device_id")))
+     JOIN "public"."users" "u" ON (("u"."id" = "d"."user_id")))
+     CROSS JOIN "config" "c")
+  WHERE (("v"."type" = 'private'::"text") AND ("v"."computed_status" = 'active'::"text") AND (("c"."use_all_agents" = true) OR ("d"."user_id" IN ( SELECT "configured_agent_ids"."id"
+           FROM "configured_agent_ids"))));
+
+
+ALTER VIEW "public"."v_batch_unlock_sim_contributions" OWNER TO "postgres";
+
+
+COMMENT ON VIEW "public"."v_batch_unlock_sim_contributions" IS 'View showing each SIM contribution to batch unlock progress with device/slot info';
 
 
 
@@ -7245,6 +8314,8 @@ CREATE TABLE IF NOT EXISTS "public"."wallet_topups" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "sender_number" "text" NOT NULL,
+    "fee_amount" numeric(10,2) DEFAULT 0.00,
+    "net_amount" numeric(10,2),
     CONSTRAINT "wallet_topups_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text"])))
 );
 
@@ -7272,6 +8343,14 @@ COMMENT ON COLUMN "public"."wallet_topups"."sender_number" IS 'Phone number used
 
 
 
+COMMENT ON COLUMN "public"."wallet_topups"."fee_amount" IS 'Fee deducted from the topup amount based on payment_method.fee_percentage';
+
+
+
+COMMENT ON COLUMN "public"."wallet_topups"."net_amount" IS 'Actual amount credited to wallet (amount - fee_amount)';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."wallet_transactions" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -7292,7 +8371,7 @@ CREATE TABLE IF NOT EXISTS "public"."wallet_transactions" (
     "withdrawal_account_number" character varying(255),
     "withdrawal_receipt_url" "text",
     CONSTRAINT "wallet_transactions_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'success'::"text", 'failed'::"text"]))),
-    CONSTRAINT "wallet_transactions_type_check" CHECK (("type" = ANY (ARRAY['commission'::"text", 'milestone'::"text", 'topup'::"text", 'withdrawal'::"text", 'purchase'::"text", 'refund'::"text", 'adjustment'::"text"])))
+    CONSTRAINT "wallet_transactions_type_check" CHECK (("type" = ANY (ARRAY['commission'::"text", 'milestone'::"text", 'topup'::"text", 'withdrawal'::"text", 'purchase'::"text", 'refund'::"text", 'adjustment'::"text", 'extension'::"text"])))
 );
 
 
@@ -7303,7 +8382,7 @@ COMMENT ON TABLE "public"."wallet_transactions" IS 'Complete audit trail of all 
 
 
 
-COMMENT ON COLUMN "public"."wallet_transactions"."type" IS 'commission, milestone, topup, withdrawal, purchase, refund, adjustment';
+COMMENT ON COLUMN "public"."wallet_transactions"."type" IS 'commission, milestone, topup, withdrawal, purchase, refund, adjustment, extension';
 
 
 
@@ -7392,6 +8471,10 @@ ALTER TABLE ONLY "public"."otp_pricing" ALTER COLUMN "id" SET DEFAULT "nextval"(
 
 
 ALTER TABLE ONLY "public"."sim_history" ALTER COLUMN "id" SET DEFAULT "nextval"('"public"."sim_history_id_seq"'::"regclass");
+
+
+
+ALTER TABLE ONLY "public"."sim_removal_violations" ALTER COLUMN "id" SET DEFAULT "nextval"('"public"."sim_removal_violations_id_seq"'::"regclass");
 
 
 
@@ -7652,6 +8735,36 @@ ALTER TABLE ONLY "public"."referral_milestones"
 
 
 
+ALTER TABLE ONLY "public"."rental_extensions"
+    ADD CONSTRAINT "rental_extensions_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_messages"
+    ADD CONSTRAINT "rental_messages_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_networks"
+    ADD CONSTRAINT "rental_networks_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_requests"
+    ADD CONSTRAINT "rental_requests_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_sessions"
+    ADD CONSTRAINT "rental_sessions_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_tiers"
+    ADD CONSTRAINT "rental_tiers_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."review_replies"
     ADD CONSTRAINT "review_replies_pkey" PRIMARY KEY ("id");
 
@@ -7664,6 +8777,76 @@ ALTER TABLE ONLY "public"."reviews"
 
 ALTER TABLE ONLY "public"."scheduler_leases"
     ADD CONSTRAINT "scheduler_leases_pkey" PRIMARY KEY ("lease_key");
+
+
+
+ALTER TABLE ONLY "public"."seller_applications"
+    ADD CONSTRAINT "seller_applications_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."seller_branding"
+    ADD CONSTRAINT "seller_branding_pkey" PRIMARY KEY ("seller_id");
+
+
+
+ALTER TABLE ONLY "public"."seller_ledger_entries"
+    ADD CONSTRAINT "seller_ledger_entries_otp_session_id_entry_type_key" UNIQUE ("otp_session_id", "entry_type");
+
+
+
+ALTER TABLE ONLY "public"."seller_ledger_entries"
+    ADD CONSTRAINT "seller_ledger_entries_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."seller_service_offers"
+    ADD CONSTRAINT "seller_service_offers_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."seller_service_offers"
+    ADD CONSTRAINT "seller_service_offers_seller_id_app_name_key" UNIQUE ("seller_id", "app_name");
+
+
+
+ALTER TABLE ONLY "public"."seller_storefronts"
+    ADD CONSTRAINT "seller_storefronts_pkey" PRIMARY KEY ("seller_id");
+
+
+
+ALTER TABLE ONLY "public"."seller_storefronts"
+    ADD CONSTRAINT "seller_storefronts_slug_key" UNIQUE ("slug");
+
+
+
+ALTER TABLE ONLY "public"."seller_telegram_bots"
+    ADD CONSTRAINT "seller_telegram_bots_pkey" PRIMARY KEY ("seller_id");
+
+
+
+ALTER TABLE ONLY "public"."seller_users"
+    ADD CONSTRAINT "seller_users_pkey" PRIMARY KEY ("seller_id", "user_id");
+
+
+
+ALTER TABLE ONLY "public"."seller_wallets"
+    ADD CONSTRAINT "seller_wallets_pkey" PRIMARY KEY ("seller_id");
+
+
+
+ALTER TABLE ONLY "public"."seller_withdrawal_requests"
+    ADD CONSTRAINT "seller_withdrawal_requests_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."sellers"
+    ADD CONSTRAINT "sellers_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."sellers"
+    ADD CONSTRAINT "sellers_slug_key" UNIQUE ("slug");
 
 
 
@@ -7716,6 +8899,11 @@ ALTER TABLE ONLY "public"."sim_history"
 
 
 
+ALTER TABLE ONLY "public"."sim_removal_violations"
+    ADD CONSTRAINT "sim_removal_violations_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."sim_stats"
     ADD CONSTRAINT "sim_stats_pkey" PRIMARY KEY ("sim_id");
 
@@ -7748,6 +8936,16 @@ ALTER TABLE ONLY "public"."system_logs"
 
 ALTER TABLE ONLY "public"."telegram_referral_invite_events"
     ADD CONSTRAINT "telegram_referral_invite_events_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."telegram_rental_warning_events"
+    ADD CONSTRAINT "telegram_rental_warning_events_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."telegram_rental_warning_events"
+    ADD CONSTRAINT "telegram_rental_warning_events_session_id_threshold_seconds_key" UNIQUE ("session_id", "threshold_seconds");
 
 
 
@@ -7919,6 +9117,10 @@ CREATE INDEX "idx_agent_transactions_available_at" ON "public"."agent_transactio
 
 
 
+CREATE INDEX "idx_agent_transactions_sim_number" ON "public"."agent_transactions" USING "btree" ("sim_number");
+
+
+
 CREATE INDEX "idx_agent_transactions_sim_usage" ON "public"."agent_transactions" USING "btree" ("sim_app_usage_id");
 
 
@@ -7944,6 +9146,10 @@ CREATE INDEX "idx_announcement_target_email" ON "public"."announcement" USING "b
 
 
 CREATE INDEX "idx_api_keys_revoked_at" ON "public"."api_keys" USING "btree" ("revoked_at");
+
+
+
+CREATE INDEX "idx_api_keys_seller_id" ON "public"."api_keys" USING "btree" ("seller_id");
 
 
 
@@ -7996,6 +9202,10 @@ CREATE INDEX "idx_contact_submissions_priority" ON "public"."contact_submissions
 
 
 CREATE INDEX "idx_contact_submissions_status" ON "public"."contact_submissions" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_devices_seller_id" ON "public"."devices" USING "btree" ("seller_id");
 
 
 
@@ -8195,6 +9405,10 @@ CREATE INDEX "idx_otp_sessions_expires_at_gmt8" ON "public"."otp_sessions" USING
 
 
 
+CREATE INDEX "idx_otp_sessions_inventory_source" ON "public"."otp_sessions" USING "btree" ("inventory_source");
+
+
+
 CREATE INDEX "idx_otp_sessions_message_count" ON "public"."otp_sessions" USING "btree" ("message_count");
 
 
@@ -8207,6 +9421,10 @@ CREATE INDEX "idx_otp_sessions_parent_session_id" ON "public"."otp_sessions" USI
 
 
 
+CREATE INDEX "idx_otp_sessions_payment_status" ON "public"."otp_sessions" USING "btree" ("payment_status") WHERE (("payment_status")::"text" = 'pending'::"text");
+
+
+
 CREATE INDEX "idx_otp_sessions_previous_sim" ON "public"."otp_sessions" USING "btree" ("previous_sim_number");
 
 
@@ -8216,6 +9434,18 @@ CREATE UNIQUE INDEX "idx_otp_sessions_public_token" ON "public"."otp_sessions" U
 
 
 CREATE INDEX "idx_otp_sessions_retry_count" ON "public"."otp_sessions" USING "btree" ("retry_count");
+
+
+
+CREATE INDEX "idx_otp_sessions_seller_id" ON "public"."otp_sessions" USING "btree" ("seller_id");
+
+
+
+CREATE INDEX "idx_otp_sessions_sim_created" ON "public"."otp_sessions" USING "btree" ("sim_number", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_otp_sessions_sim_status" ON "public"."otp_sessions" USING "btree" ("sim_number", "status");
 
 
 
@@ -8232,6 +9462,14 @@ CREATE INDEX "idx_otp_sessions_status_expires" ON "public"."otp_sessions" USING 
 
 
 CREATE INDEX "idx_otp_sessions_status_user_email" ON "public"."otp_sessions" USING "btree" ("status", "user_email");
+
+
+
+CREATE UNIQUE INDEX "idx_otp_sessions_unique_user_app_sim_active" ON "public"."otp_sessions" USING "btree" ("user_id", "app_name", "sim_number") WHERE (("status" = 'active'::"text") AND ("sim_number" IS NOT NULL) AND ("user_id" IS NOT NULL));
+
+
+
+COMMENT ON INDEX "public"."idx_otp_sessions_unique_user_app_sim_active" IS 'One active session per user per app per SIM number.';
 
 
 
@@ -8331,6 +9569,42 @@ CREATE INDEX "idx_referral_milestones_status" ON "public"."referral_milestones" 
 
 
 
+CREATE INDEX "idx_rental_messages_received" ON "public"."rental_messages" USING "btree" ("received_at" DESC);
+
+
+
+CREATE INDEX "idx_rental_messages_session" ON "public"."rental_messages" USING "btree" ("session_id");
+
+
+
+CREATE INDEX "idx_rental_requests_payment_status" ON "public"."rental_requests" USING "btree" ("payment_status");
+
+
+
+CREATE INDEX "idx_rental_requests_status" ON "public"."rental_requests" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_rental_requests_user" ON "public"."rental_requests" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "idx_rental_sessions_expires" ON "public"."rental_sessions" USING "btree" ("expires_at");
+
+
+
+CREATE INDEX "idx_rental_sessions_sim" ON "public"."rental_sessions" USING "btree" ("sim_id");
+
+
+
+CREATE INDEX "idx_rental_sessions_status" ON "public"."rental_sessions" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_rental_sessions_user" ON "public"."rental_sessions" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "idx_review_replies_created_at" ON "public"."review_replies" USING "btree" ("created_at" DESC);
 
 
@@ -8363,11 +9637,51 @@ CREATE INDEX "idx_reviews_user_id" ON "public"."reviews" USING "btree" ("user_id
 
 
 
+CREATE UNIQUE INDEX "idx_seller_applications_desired_slug_pending" ON "public"."seller_applications" USING "btree" ("lower"("desired_slug")) WHERE ("status" = 'pending'::"text");
+
+
+
+CREATE INDEX "idx_seller_ledger_seller" ON "public"."seller_ledger_entries" USING "btree" ("seller_id", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_seller_service_offers_seller" ON "public"."seller_service_offers" USING "btree" ("seller_id");
+
+
+
+CREATE INDEX "idx_seller_storefronts_slug" ON "public"."seller_storefronts" USING "btree" ("slug");
+
+
+
+CREATE INDEX "idx_seller_telegram_bots_username" ON "public"."seller_telegram_bots" USING "btree" ("bot_username");
+
+
+
+CREATE INDEX "idx_seller_users_user_id" ON "public"."seller_users" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "idx_seller_withdrawal_requests_seller" ON "public"."seller_withdrawal_requests" USING "btree" ("seller_id", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_sellers_owner_user_id" ON "public"."sellers" USING "btree" ("owner_user_id");
+
+
+
+CREATE INDEX "idx_sellers_type_status" ON "public"."sellers" USING "btree" ("type", "status");
+
+
+
 CREATE INDEX "idx_sim_app_usage_agent" ON "public"."sim_app_usage" USING "btree" ("agent_user_id");
 
 
 
 CREATE INDEX "idx_sim_app_usage_agent_direct" ON "public"."sim_app_usage" USING "btree" ("agent_direct", "agent_user_id", "app_name");
+
+
+
+CREATE INDEX "idx_sim_app_usage_seller_id" ON "public"."sim_app_usage" USING "btree" ("seller_id");
 
 
 
@@ -8419,6 +9733,22 @@ CREATE INDEX "idx_sim_history_sim_number" ON "public"."sim_history" USING "btree
 
 
 
+CREATE INDEX "idx_sim_removal_violations_created_at" ON "public"."sim_removal_violations" USING "btree" ("created_at");
+
+
+
+CREATE INDEX "idx_sim_removal_violations_pause_until" ON "public"."sim_removal_violations" USING "btree" ("pause_until");
+
+
+
+CREATE INDEX "idx_sim_removal_violations_sim_id" ON "public"."sim_removal_violations" USING "btree" ("sim_id");
+
+
+
+CREATE INDEX "idx_sim_removal_violations_user_id" ON "public"."sim_removal_violations" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "idx_sim_stats_updated_at" ON "public"."sim_stats" USING "btree" ("updated_at" DESC);
 
 
@@ -8427,11 +9757,19 @@ CREATE INDEX "idx_sims_completed_desc" ON "public"."sims" USING "btree" ("total_
 
 
 
+CREATE INDEX "idx_sims_created_at" ON "public"."sims" USING "btree" ("created_at");
+
+
+
 CREATE INDEX "idx_sims_device_id" ON "public"."sims" USING "btree" ("device_id");
 
 
 
 CREATE INDEX "idx_sims_failed_asc" ON "public"."sims" USING "btree" ("total_failed");
+
+
+
+CREATE INDEX "idx_sims_locked_until" ON "public"."sims" USING "btree" ("locked_until");
 
 
 
@@ -8444,6 +9782,18 @@ CREATE INDEX "idx_sims_paused_at" ON "public"."sims" USING "btree" ("paused_at" 
 
 
 CREATE INDEX "idx_sims_paused_reason" ON "public"."sims" USING "btree" ("paused_reason");
+
+
+
+CREATE INDEX "idx_sims_paused_until" ON "public"."sims" USING "btree" ("paused_until");
+
+
+
+CREATE INDEX "idx_sims_seller_id" ON "public"."sims" USING "btree" ("seller_id");
+
+
+
+CREATE INDEX "idx_sims_slot" ON "public"."sims" USING "btree" ("slot") WHERE ("slot" IS NOT NULL);
 
 
 
@@ -8499,6 +9849,10 @@ CREATE INDEX "idx_system_logs_timestamp" ON "public"."system_logs" USING "btree"
 
 
 
+CREATE INDEX "idx_user_chat_links_seller_id" ON "public"."user_chat_links" USING "btree" ("seller_id") WHERE ("seller_id" IS NOT NULL);
+
+
+
 CREATE INDEX "idx_user_chat_links_user_provider" ON "public"."user_chat_links" USING "btree" ("user_id", "provider");
 
 
@@ -8516,6 +9870,10 @@ CREATE INDEX "idx_users_referral_code" ON "public"."users" USING "btree" ("refer
 
 
 CREATE INDEX "idx_users_referred_by" ON "public"."users" USING "btree" ("referred_by") WHERE ("referred_by" IS NOT NULL);
+
+
+
+CREATE INDEX "idx_users_registered_seller_id" ON "public"."users" USING "btree" ("registered_seller_id") WHERE ("registered_seller_id" IS NOT NULL);
 
 
 
@@ -8560,6 +9918,10 @@ CREATE INDEX "idx_wallet_topups_user_id" ON "public"."wallet_topups" USING "btre
 
 
 CREATE INDEX "idx_wallet_transactions_created_at" ON "public"."wallet_transactions" USING "btree" ("created_at" DESC);
+
+
+
+CREATE UNIQUE INDEX "idx_wallet_transactions_quick_buy_session" ON "public"."wallet_transactions" USING "btree" ("otp_session_id") WHERE (("type" = 'purchase'::"text") AND ("status" = 'success'::"text") AND ("otp_session_id" IS NOT NULL));
 
 
 
@@ -8733,9 +10095,19 @@ CREATE OR REPLACE VIEW "public"."v_vouchers_with_usage" AS
 
 CREATE OR REPLACE TRIGGER "auto_link_sms_automation_trigger" AFTER INSERT ON "public"."sms_messages" FOR EACH ROW EXECUTE FUNCTION "public"."trigger_auto_link_sms_automation"();
 
+ALTER TABLE "public"."sms_messages" DISABLE TRIGGER "auto_link_sms_automation_trigger";
+
+
+
+CREATE OR REPLACE TRIGGER "auto_link_sms_rental_trigger" AFTER INSERT ON "public"."sms_messages" FOR EACH ROW EXECUTE FUNCTION "public"."trigger_auto_link_sms_rental"();
+
+ALTER TABLE "public"."sms_messages" DISABLE TRIGGER "auto_link_sms_rental_trigger";
+
 
 
 CREATE OR REPLACE TRIGGER "auto_link_sms_trigger" AFTER INSERT ON "public"."sms_messages" FOR EACH ROW EXECUTE FUNCTION "public"."trigger_auto_link_sms"();
+
+ALTER TABLE "public"."sms_messages" DISABLE TRIGGER "auto_link_sms_trigger";
 
 
 
@@ -8748,6 +10120,14 @@ CREATE OR REPLACE TRIGGER "trg_accumulate_sim_uptime" BEFORE UPDATE OF "last_hea
 
 
 CREATE OR REPLACE TRIGGER "trg_apply_sim_failure_streak_on_failure_record" AFTER INSERT ON "public"."sim_failure_records" FOR EACH ROW EXECUTE FUNCTION "public"."apply_sim_failure_streak_on_failure_record"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_apply_topup_fee" BEFORE INSERT ON "public"."wallet_topups" FOR EACH ROW EXECUTE FUNCTION "public"."apply_topup_fee"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_auto_assign_rental" AFTER UPDATE OF "payment_status" ON "public"."rental_requests" FOR EACH ROW EXECUTE FUNCTION "public"."check_auto_assign_rental"();
 
 
 
@@ -8768,6 +10148,10 @@ CREATE OR REPLACE TRIGGER "trg_clear_expires_at_if_pending_update" BEFORE UPDATE
 
 
 CREATE OR REPLACE TRIGGER "trg_create_agent_transaction_from_usage" AFTER INSERT OR UPDATE OF "agent_user_id", "gross_amount", "agent_share", "site_share" ON "public"."sim_app_usage" FOR EACH ROW EXECUTE FUNCTION "public"."create_agent_transaction_from_usage"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_credit_seller_markup_on_complete" AFTER UPDATE OF "status" ON "public"."otp_sessions" FOR EACH ROW EXECUTE FUNCTION "public"."credit_seller_markup_on_session_complete"();
 
 
 
@@ -8835,7 +10219,7 @@ CREATE OR REPLACE TRIGGER "trg_process_agent_earnings_on_otp_complete" AFTER UPD
 
 
 
-CREATE OR REPLACE TRIGGER "trg_rebuild_sim_stats_on_insert" AFTER INSERT ON "public"."agent_transactions" FOR EACH ROW EXECUTE FUNCTION "public"."trg_call_rebuild_sim_stats_total_earnings"();
+CREATE OR REPLACE TRIGGER "trg_rebuild_sim_stats_on_insert" AFTER INSERT OR DELETE OR UPDATE OF "agent_share", "sim_number" ON "public"."agent_transactions" FOR EACH ROW EXECUTE FUNCTION "public"."trg_call_rebuild_sim_stats_total_earnings"();
 
 
 
@@ -8908,6 +10292,10 @@ CREATE OR REPLACE TRIGGER "trg_update_agent_balance_on_update" AFTER UPDATE OF "
 
 
 CREATE OR REPLACE TRIGGER "trg_update_device_and_sims_status" AFTER UPDATE OF "last_heartbeat" ON "public"."devices" FOR EACH ROW EXECUTE FUNCTION "public"."update_device_and_sim_status"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_update_device_is_online" BEFORE INSERT OR UPDATE OF "last_seen" ON "public"."devices" FOR EACH ROW EXECUTE FUNCTION "public"."update_device_is_online"();
 
 
 
@@ -9093,12 +10481,22 @@ ALTER TABLE ONLY "public"."announcement"
 
 
 ALTER TABLE ONLY "public"."api_keys"
+    ADD CONSTRAINT "api_keys_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."api_keys"
     ADD CONSTRAINT "api_keys_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."chat_link_codes"
     ADD CONSTRAINT "chat_link_codes_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."devices"
+    ADD CONSTRAINT "devices_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE SET NULL;
 
 
 
@@ -9134,6 +10532,11 @@ ALTER TABLE ONLY "public"."manual_payments"
 
 ALTER TABLE ONLY "public"."manual_payments"
     ADD CONSTRAINT "manual_payments_payment_method_id_fkey" FOREIGN KEY ("payment_method_id") REFERENCES "public"."payment_methods"("id");
+
+
+
+ALTER TABLE ONLY "public"."manual_payments"
+    ADD CONSTRAINT "manual_payments_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE SET NULL;
 
 
 
@@ -9184,6 +10587,11 @@ ALTER TABLE ONLY "public"."otp_sessions"
 
 ALTER TABLE ONLY "public"."otp_sessions"
     ADD CONSTRAINT "otp_sessions_agent_user_id_fkey" FOREIGN KEY ("agent_user_id") REFERENCES "public"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."otp_sessions"
+    ADD CONSTRAINT "otp_sessions_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE SET NULL;
 
 
 
@@ -9242,6 +10650,81 @@ ALTER TABLE ONLY "public"."referral_milestones"
 
 
 
+ALTER TABLE ONLY "public"."rental_extensions"
+    ADD CONSTRAINT "rental_extensions_session_id_fkey" FOREIGN KEY ("session_id") REFERENCES "public"."rental_sessions"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."rental_extensions"
+    ADD CONSTRAINT "rental_extensions_tier_id_fkey" FOREIGN KEY ("tier_id") REFERENCES "public"."rental_tiers"("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_extensions"
+    ADD CONSTRAINT "rental_extensions_voucher_id_fkey" FOREIGN KEY ("voucher_id") REFERENCES "public"."vouchers"("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_messages"
+    ADD CONSTRAINT "rental_messages_session_id_fkey" FOREIGN KEY ("session_id") REFERENCES "public"."rental_sessions"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."rental_requests"
+    ADD CONSTRAINT "rental_requests_approved_by_fkey" FOREIGN KEY ("approved_by") REFERENCES "auth"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_requests"
+    ADD CONSTRAINT "rental_requests_network_id_fkey" FOREIGN KEY ("network_id") REFERENCES "public"."rental_networks"("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_requests"
+    ADD CONSTRAINT "rental_requests_tier_id_fkey" FOREIGN KEY ("tier_id") REFERENCES "public"."rental_tiers"("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_requests"
+    ADD CONSTRAINT "rental_requests_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."rental_requests"
+    ADD CONSTRAINT "rental_requests_voucher_id_fkey" FOREIGN KEY ("voucher_id") REFERENCES "public"."vouchers"("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_sessions"
+    ADD CONSTRAINT "rental_sessions_extension_tier_id_fkey" FOREIGN KEY ("extension_tier_id") REFERENCES "public"."rental_tiers"("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_sessions"
+    ADD CONSTRAINT "rental_sessions_network_id_fkey" FOREIGN KEY ("network_id") REFERENCES "public"."rental_networks"("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_sessions"
+    ADD CONSTRAINT "rental_sessions_request_id_fkey" FOREIGN KEY ("request_id") REFERENCES "public"."rental_requests"("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_sessions"
+    ADD CONSTRAINT "rental_sessions_sim_id_fkey" FOREIGN KEY ("sim_id") REFERENCES "public"."sims"("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_sessions"
+    ADD CONSTRAINT "rental_sessions_tier_id_fkey" FOREIGN KEY ("tier_id") REFERENCES "public"."rental_tiers"("id");
+
+
+
+ALTER TABLE ONLY "public"."rental_sessions"
+    ADD CONSTRAINT "rental_sessions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."review_replies"
     ADD CONSTRAINT "review_replies_author_id_fkey" FOREIGN KEY ("author_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
@@ -9262,8 +10745,93 @@ ALTER TABLE ONLY "public"."reviews"
 
 
 
+ALTER TABLE ONLY "public"."seller_applications"
+    ADD CONSTRAINT "seller_applications_created_seller_id_fkey" FOREIGN KEY ("created_seller_id") REFERENCES "public"."sellers"("id");
+
+
+
+ALTER TABLE ONLY "public"."seller_applications"
+    ADD CONSTRAINT "seller_applications_reviewed_by_fkey" FOREIGN KEY ("reviewed_by") REFERENCES "public"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."seller_applications"
+    ADD CONSTRAINT "seller_applications_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."seller_branding"
+    ADD CONSTRAINT "seller_branding_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."seller_ledger_entries"
+    ADD CONSTRAINT "seller_ledger_entries_otp_session_id_fkey" FOREIGN KEY ("otp_session_id") REFERENCES "public"."otp_sessions"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."seller_ledger_entries"
+    ADD CONSTRAINT "seller_ledger_entries_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."seller_service_offers"
+    ADD CONSTRAINT "seller_service_offers_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."seller_storefronts"
+    ADD CONSTRAINT "seller_storefronts_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."seller_telegram_bots"
+    ADD CONSTRAINT "seller_telegram_bots_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."seller_users"
+    ADD CONSTRAINT "seller_users_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."seller_users"
+    ADD CONSTRAINT "seller_users_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."seller_wallets"
+    ADD CONSTRAINT "seller_wallets_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."seller_withdrawal_requests"
+    ADD CONSTRAINT "seller_withdrawal_requests_reviewed_by_fkey" FOREIGN KEY ("reviewed_by") REFERENCES "public"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."seller_withdrawal_requests"
+    ADD CONSTRAINT "seller_withdrawal_requests_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."seller_withdrawal_requests"
+    ADD CONSTRAINT "seller_withdrawal_requests_withdrawal_payment_method_id_fkey" FOREIGN KEY ("withdrawal_payment_method_id") REFERENCES "public"."withdrawal_payment_methods"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."sellers"
+    ADD CONSTRAINT "sellers_owner_user_id_fkey" FOREIGN KEY ("owner_user_id") REFERENCES "public"."users"("id") ON DELETE SET NULL;
+
+
+
 ALTER TABLE ONLY "public"."sim_app_usage"
     ADD CONSTRAINT "sim_app_usage_agent_user_id_fkey" FOREIGN KEY ("agent_user_id") REFERENCES "public"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."sim_app_usage"
+    ADD CONSTRAINT "sim_app_usage_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE SET NULL;
 
 
 
@@ -9297,13 +10865,18 @@ ALTER TABLE ONLY "public"."sim_group_members"
 
 
 
-ALTER TABLE ONLY "public"."sim_group_members"
-    ADD CONSTRAINT "sim_group_members_sim_number_fkey" FOREIGN KEY ("sim_number") REFERENCES "public"."sims"("number") ON DELETE CASCADE;
-
-
-
 ALTER TABLE ONLY "public"."sim_history"
     ADD CONSTRAINT "sim_history_device_id_fkey" FOREIGN KEY ("device_id") REFERENCES "public"."devices"("device_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."sim_removal_violations"
+    ADD CONSTRAINT "sim_removal_violations_sim_id_fkey" FOREIGN KEY ("sim_id") REFERENCES "public"."sims"("id");
+
+
+
+ALTER TABLE ONLY "public"."sim_removal_violations"
+    ADD CONSTRAINT "sim_removal_violations_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id");
 
 
 
@@ -9314,6 +10887,11 @@ ALTER TABLE ONLY "public"."sim_stats"
 
 ALTER TABLE ONLY "public"."sims"
     ADD CONSTRAINT "sims_device_id_fkey" FOREIGN KEY ("device_id") REFERENCES "public"."devices"("device_id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."sims"
+    ADD CONSTRAINT "sims_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE SET NULL;
 
 
 
@@ -9337,6 +10915,11 @@ ALTER TABLE ONLY "public"."telegram_referral_invite_events"
 
 
 
+ALTER TABLE ONLY "public"."telegram_rental_warning_events"
+    ADD CONSTRAINT "telegram_rental_warning_events_session_id_fkey" FOREIGN KEY ("session_id") REFERENCES "public"."rental_sessions"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."telegram_session_warning_events"
     ADD CONSTRAINT "telegram_session_warning_events_session_id_fkey" FOREIGN KEY ("session_id") REFERENCES "public"."otp_sessions"("id") ON DELETE CASCADE;
 
@@ -9354,6 +10937,11 @@ ALTER TABLE ONLY "public"."telegram_sms_message_push_events"
 
 ALTER TABLE ONLY "public"."telegram_sms_message_push_events"
     ADD CONSTRAINT "telegram_sms_message_push_events_sms_message_id_fkey" FOREIGN KEY ("sms_message_id") REFERENCES "public"."sms_messages"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."user_chat_links"
+    ADD CONSTRAINT "user_chat_links_seller_id_fkey" FOREIGN KEY ("seller_id") REFERENCES "public"."sellers"("id") ON DELETE SET NULL;
 
 
 
@@ -9384,6 +10972,11 @@ ALTER TABLE ONLY "public"."users"
 
 ALTER TABLE ONLY "public"."users"
     ADD CONSTRAINT "users_referred_by_fkey" FOREIGN KEY ("referred_by") REFERENCES "public"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."users"
+    ADD CONSTRAINT "users_registered_seller_id_fkey" FOREIGN KEY ("registered_seller_id") REFERENCES "public"."sellers"("id") ON DELETE SET NULL;
 
 
 
@@ -9706,9 +11299,6 @@ GRANT USAGE ON SCHEMA "public" TO "service_role";
 
 
 
-
-
-
 GRANT ALL ON FUNCTION "public"."acquire_scheduler_lease"("p_lease_key" "text", "p_ttl_seconds" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."acquire_scheduler_lease"("p_lease_key" "text", "p_ttl_seconds" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."acquire_scheduler_lease"("p_lease_key" "text", "p_ttl_seconds" integer) TO "service_role";
@@ -9727,9 +11317,21 @@ GRANT ALL ON FUNCTION "public"."apply_sim_failure_streak_on_failure_record"() TO
 
 
 
+GRANT ALL ON FUNCTION "public"."apply_topup_fee"() TO "anon";
+GRANT ALL ON FUNCTION "public"."apply_topup_fee"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."apply_topup_fee"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."assign_default_referrer_on_insert"() TO "anon";
 GRANT ALL ON FUNCTION "public"."assign_default_referrer_on_insert"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."assign_default_referrer_on_insert"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."auto_assign_rental_sim"("p_request_id" "uuid", "p_network_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."auto_assign_rental_sim"("p_request_id" "uuid", "p_network_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."auto_assign_rental_sim"("p_request_id" "uuid", "p_network_id" "uuid") TO "service_role";
 
 
 
@@ -9742,6 +11344,12 @@ GRANT ALL ON FUNCTION "public"."auto_generate_referral_code"() TO "service_role"
 GRANT ALL ON FUNCTION "public"."auto_link_sms_to_otp_session"("p_sim_number" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."auto_link_sms_to_otp_session"("p_sim_number" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."auto_link_sms_to_otp_session"("p_sim_number" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."auto_link_sms_to_rental_session"("p_sim_number" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."auto_link_sms_to_rental_session"("p_sim_number" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."auto_link_sms_to_rental_session"("p_sim_number" "text") TO "service_role";
 
 
 
@@ -9766,6 +11374,12 @@ GRANT ALL ON FUNCTION "public"."auto_mature_pending_transactions"() TO "service_
 GRANT ALL ON FUNCTION "public"."backfill_sim_stats_from_usage"() TO "anon";
 GRANT ALL ON FUNCTION "public"."backfill_sim_stats_from_usage"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."backfill_sim_stats_from_usage"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."check_auto_assign_rental"() TO "anon";
+GRANT ALL ON FUNCTION "public"."check_auto_assign_rental"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."check_auto_assign_rental"() TO "service_role";
 
 
 
@@ -9794,6 +11408,12 @@ GRANT ALL ON FUNCTION "public"."clear_expires_at_if_pending"() TO "service_role"
 
 
 
+GRANT ALL ON FUNCTION "public"."complete_otp_session"("p_session_id" "uuid", "p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."complete_otp_session"("p_session_id" "uuid", "p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."complete_otp_session"("p_session_id" "uuid", "p_user_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."create_agent_invite_earning_for_tx"("p_agent_transaction_id" bigint) TO "anon";
 GRANT ALL ON FUNCTION "public"."create_agent_invite_earning_for_tx"("p_agent_transaction_id" bigint) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."create_agent_invite_earning_for_tx"("p_agent_transaction_id" bigint) TO "service_role";
@@ -9809,6 +11429,12 @@ GRANT ALL ON FUNCTION "public"."create_agent_transaction_from_usage"() TO "servi
 GRANT ALL ON FUNCTION "public"."create_otp_session"("p_user_id" "uuid", "p_app_name" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."create_otp_session"("p_user_id" "uuid", "p_app_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."create_otp_session"("p_user_id" "uuid", "p_app_name" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."credit_seller_markup_on_session_complete"() TO "anon";
+GRANT ALL ON FUNCTION "public"."credit_seller_markup_on_session_complete"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."credit_seller_markup_on_session_complete"() TO "service_role";
 
 
 
@@ -9869,6 +11495,12 @@ GRANT ALL ON FUNCTION "public"."expire_old_sessions"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."expire_otp_sessions"() TO "anon";
 GRANT ALL ON FUNCTION "public"."expire_otp_sessions"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."expire_otp_sessions"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."expire_rental_sessions"() TO "anon";
+GRANT ALL ON FUNCTION "public"."expire_rental_sessions"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."expire_rental_sessions"() TO "service_role";
 
 
 
@@ -9953,6 +11585,12 @@ GRANT ALL ON FUNCTION "public"."handle_expired_session_with_messages"() TO "serv
 GRANT ALL ON FUNCTION "public"."handle_manual_payment_status"("p_payment_id" "uuid", "p_status" "text", "p_approved_by" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."handle_manual_payment_status"("p_payment_id" "uuid", "p_status" "text", "p_approved_by" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."handle_manual_payment_status"("p_payment_id" "uuid", "p_status" "text", "p_approved_by" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."increment_message_count"("session_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."increment_message_count"("session_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."increment_message_count"("session_id" "uuid") TO "service_role";
 
 
 
@@ -10048,6 +11686,12 @@ GRANT ALL ON FUNCTION "public"."process_agent_earnings_on_otp_complete"() TO "se
 
 
 
+GRANT ALL ON FUNCTION "public"."process_pending_sms_for_rentals"() TO "anon";
+GRANT ALL ON FUNCTION "public"."process_pending_sms_for_rentals"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."process_pending_sms_for_rentals"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."process_referral_commission"("p_otp_session_id" "uuid", "p_user_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."process_referral_commission"("p_otp_session_id" "uuid", "p_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."process_referral_commission"("p_otp_session_id" "uuid", "p_user_id" "uuid") TO "service_role";
@@ -10096,9 +11740,21 @@ GRANT ALL ON FUNCTION "public"."record_sim_heartbeat"("p_sim_number" "text") TO 
 
 
 
+GRANT ALL ON FUNCTION "public"."refresh_sim_stats_total_earnings_for_sim"("p_sim_id" bigint) TO "anon";
+GRANT ALL ON FUNCTION "public"."refresh_sim_stats_total_earnings_for_sim"("p_sim_id" bigint) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."refresh_sim_stats_total_earnings_for_sim"("p_sim_id" bigint) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."reset_sim_failure_streak_on_success_usage"() TO "anon";
 GRANT ALL ON FUNCTION "public"."reset_sim_failure_streak_on_success_usage"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."reset_sim_failure_streak_on_success_usage"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."resolve_sim_id_from_agent_sim_number"("p_sim_number" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."resolve_sim_id_from_agent_sim_number"("p_sim_number" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."resolve_sim_id_from_agent_sim_number"("p_sim_number" "text") TO "service_role";
 
 
 
@@ -10229,6 +11885,12 @@ GRANT ALL ON FUNCTION "public"."trigger_auto_link_sms_automation"() TO "service_
 
 
 
+GRANT ALL ON FUNCTION "public"."trigger_auto_link_sms_rental"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trigger_auto_link_sms_rental"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trigger_auto_link_sms_rental"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."trigger_process_referral_on_otp_complete"() TO "anon";
 GRANT ALL ON FUNCTION "public"."trigger_process_referral_on_otp_complete"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."trigger_process_referral_on_otp_complete"() TO "service_role";
@@ -10280,6 +11942,12 @@ GRANT ALL ON FUNCTION "public"."update_contact_submissions_updated_at"() TO "ser
 GRANT ALL ON FUNCTION "public"."update_device_and_sim_status"() TO "anon";
 GRANT ALL ON FUNCTION "public"."update_device_and_sim_status"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_device_and_sim_status"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."update_device_is_online"() TO "anon";
+GRANT ALL ON FUNCTION "public"."update_device_is_online"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_device_is_online"() TO "service_role";
 
 
 
@@ -10724,6 +12392,42 @@ GRANT ALL ON TABLE "public"."referral_milestones" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."rental_extensions" TO "anon";
+GRANT ALL ON TABLE "public"."rental_extensions" TO "authenticated";
+GRANT ALL ON TABLE "public"."rental_extensions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."rental_messages" TO "anon";
+GRANT ALL ON TABLE "public"."rental_messages" TO "authenticated";
+GRANT ALL ON TABLE "public"."rental_messages" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."rental_networks" TO "anon";
+GRANT ALL ON TABLE "public"."rental_networks" TO "authenticated";
+GRANT ALL ON TABLE "public"."rental_networks" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."rental_requests" TO "anon";
+GRANT ALL ON TABLE "public"."rental_requests" TO "authenticated";
+GRANT ALL ON TABLE "public"."rental_requests" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."rental_sessions" TO "anon";
+GRANT ALL ON TABLE "public"."rental_sessions" TO "authenticated";
+GRANT ALL ON TABLE "public"."rental_sessions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."rental_tiers" TO "anon";
+GRANT ALL ON TABLE "public"."rental_tiers" TO "authenticated";
+GRANT ALL ON TABLE "public"."rental_tiers" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."review_replies" TO "anon";
 GRANT ALL ON TABLE "public"."review_replies" TO "authenticated";
 GRANT ALL ON TABLE "public"."review_replies" TO "service_role";
@@ -10739,6 +12443,78 @@ GRANT ALL ON TABLE "public"."reviews" TO "service_role";
 GRANT ALL ON TABLE "public"."scheduler_leases" TO "anon";
 GRANT ALL ON TABLE "public"."scheduler_leases" TO "authenticated";
 GRANT ALL ON TABLE "public"."scheduler_leases" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."seller_applications" TO "anon";
+GRANT ALL ON TABLE "public"."seller_applications" TO "authenticated";
+GRANT ALL ON TABLE "public"."seller_applications" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."seller_branding" TO "anon";
+GRANT ALL ON TABLE "public"."seller_branding" TO "authenticated";
+GRANT ALL ON TABLE "public"."seller_branding" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."seller_ledger_entries" TO "anon";
+GRANT ALL ON TABLE "public"."seller_ledger_entries" TO "authenticated";
+GRANT ALL ON TABLE "public"."seller_ledger_entries" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."seller_ledger_entries_id_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."seller_ledger_entries_id_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."seller_ledger_entries_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."seller_service_offers" TO "anon";
+GRANT ALL ON TABLE "public"."seller_service_offers" TO "authenticated";
+GRANT ALL ON TABLE "public"."seller_service_offers" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."seller_storefronts" TO "anon";
+GRANT ALL ON TABLE "public"."seller_storefronts" TO "authenticated";
+GRANT ALL ON TABLE "public"."seller_storefronts" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."seller_telegram_bots" TO "anon";
+GRANT ALL ON TABLE "public"."seller_telegram_bots" TO "authenticated";
+GRANT ALL ON TABLE "public"."seller_telegram_bots" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."seller_users" TO "anon";
+GRANT ALL ON TABLE "public"."seller_users" TO "authenticated";
+GRANT ALL ON TABLE "public"."seller_users" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."seller_wallets" TO "anon";
+GRANT ALL ON TABLE "public"."seller_wallets" TO "authenticated";
+GRANT ALL ON TABLE "public"."seller_wallets" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."seller_withdrawal_requests" TO "anon";
+GRANT ALL ON TABLE "public"."seller_withdrawal_requests" TO "authenticated";
+GRANT ALL ON TABLE "public"."seller_withdrawal_requests" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."seller_withdrawal_requests_id_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."seller_withdrawal_requests_id_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."seller_withdrawal_requests_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."sellers" TO "anon";
+GRANT ALL ON TABLE "public"."sellers" TO "authenticated";
+GRANT ALL ON TABLE "public"."sellers" TO "service_role";
 
 
 
@@ -10814,6 +12590,18 @@ GRANT ALL ON TABLE "public"."sim_last_used_app_by_sim" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."sim_removal_violations" TO "anon";
+GRANT ALL ON TABLE "public"."sim_removal_violations" TO "authenticated";
+GRANT ALL ON TABLE "public"."sim_removal_violations" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."sim_removal_violations_id_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."sim_removal_violations_id_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."sim_removal_violations_id_seq" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."sim_stats" TO "anon";
 GRANT ALL ON TABLE "public"."sim_stats" TO "authenticated";
 GRANT ALL ON TABLE "public"."sim_stats" TO "service_role";
@@ -10853,6 +12641,12 @@ GRANT ALL ON SEQUENCE "public"."system_logs_id_seq" TO "service_role";
 GRANT ALL ON TABLE "public"."telegram_referral_invite_events" TO "anon";
 GRANT ALL ON TABLE "public"."telegram_referral_invite_events" TO "authenticated";
 GRANT ALL ON TABLE "public"."telegram_referral_invite_events" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."telegram_rental_warning_events" TO "anon";
+GRANT ALL ON TABLE "public"."telegram_rental_warning_events" TO "authenticated";
+GRANT ALL ON TABLE "public"."telegram_rental_warning_events" TO "service_role";
 
 
 
@@ -10943,6 +12737,12 @@ GRANT ALL ON TABLE "public"."v_sims_with_status" TO "service_role";
 GRANT ALL ON TABLE "public"."v_batch_unlock_progress" TO "anon";
 GRANT ALL ON TABLE "public"."v_batch_unlock_progress" TO "authenticated";
 GRANT ALL ON TABLE "public"."v_batch_unlock_progress" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."v_batch_unlock_sim_contributions" TO "anon";
+GRANT ALL ON TABLE "public"."v_batch_unlock_sim_contributions" TO "authenticated";
+GRANT ALL ON TABLE "public"."v_batch_unlock_sim_contributions" TO "service_role";
 
 
 
